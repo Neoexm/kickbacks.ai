@@ -1,0 +1,129 @@
+import * as vscode from "vscode";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { writeFileSync, readFileSync, statSync } from "node:fs";
+import { UpdateClient } from "../update/client";
+import { buildVersion } from "../buildinfo";
+import { dlog } from "../log";
+import { errMsg } from "../util/errMsg";
+import { DEFAULT_POLL_MS } from "../config";
+
+const UPD_KEY = "vibe-ads.update.attempted";
+const UPD_TRANSIENT_KEY = "vibe-ads.update.transient";
+const UPD_COOLDOWN_MS = 30 * 60 * 1000;
+const UPD_TRANSIENT_COOLDOWN_MS = 15 * 60 * 1000;
+const UPD_RING_CAP = 16;
+
+type Ring = { k: string; ts: number }[];
+
+function updKey(v: string, sha?: string): string {
+  return sha ? `${v}@${sha.slice(0, 16)}` : v;
+}
+
+function ringGet(ctx: vscode.ExtensionContext, key: string): Ring {
+  const raw = ctx.globalState.get<unknown>(key);
+  return Array.isArray(raw) ? (raw as Ring).filter(
+    (e) => e && typeof e.k === "string" && typeof e.ts === "number") : [];
+}
+
+function ringSeen(ctx: vscode.ExtensionContext, key: string, k: string, cooldown: number): boolean {
+  const now = Date.now();
+  return ringGet(ctx, key).some((e) => e.k === k && now - e.ts < cooldown);
+}
+
+function ringMark(ctx: vscode.ExtensionContext, key: string, k: string): void {
+  const next = ringGet(ctx, key).filter((e) => e.k !== k);
+  next.push({ k, ts: Date.now() });
+  while (next.length > UPD_RING_CAP) next.shift();
+  void ctx.globalState.update(key, next);
+}
+
+export interface SelfUpdateResult {
+  updater: UpdateClient;
+  installVsix: (vsix: ArrayBuffer) => Promise<void>;
+}
+
+export function setupSelfUpdate(
+  ctx: vscode.ExtensionContext,
+  updateBase: string,
+  currentVersion: string,
+  localVsixPath: string | undefined,
+  lastLocalVsixMtime: number,
+  watchFileFn: typeof import("node:fs").watchFile,
+  timers: NodeJS.Timeout[],
+  updatePollIntervalMs: number | undefined,
+): SelfUpdateResult {
+  const installVsix = async (vsix: ArrayBuffer): Promise<void> => {
+    const p = join(tmpdir(), `vibe-ads-update-${Date.now()}.vsix`);
+    writeFileSync(p, Buffer.from(vsix));
+    await vscode.commands.executeCommand(
+      "workbench.extensions.installExtension", vscode.Uri.file(p));
+    await ctx.globalState.update("kickbacks.debug.on", true);
+    dlog("ext", "selfupdate.installed", { path: p });
+    void (async () => {
+      try {
+        const choice = await vscode.window.showInformationMessage?.(
+          "Kickbacks updated. Reload window to activate the new build?",
+          { modal: false }, "Reload Window", "Later");
+        dlog("ext", "selfupdate.toast", { choice: choice || "dismissed" });
+        if (choice === "Reload Window") {
+          await vscode.commands.executeCommand(
+            "workbench.action.reloadWindow");
+        }
+      } catch (e) {
+        dlog("ext", "selfupdate.toast.err",
+          { msg: errMsg(e) });
+      }
+    })();
+  };
+
+  // Local-vsix watcher
+  if (localVsixPath) {
+    let localMtime = lastLocalVsixMtime;
+    try {
+      watchFileFn(localVsixPath, { interval: 2000 }, (curr) => {
+        if (!curr.mtimeMs || curr.mtimeMs === localMtime) return;
+        localMtime = curr.mtimeMs;
+        try {
+          const bytes = readFileSync(localVsixPath);
+          dlog("ext", "selfupdate.local", { path: localVsixPath, bytes: bytes.length });
+          void installVsix(bytes.buffer.slice(
+            bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+        } catch (e) {
+          dlog("ext", "selfupdate.local.err",
+            { msg: errMsg(e) });
+        }
+      });
+    } catch { /* never block activation */ }
+  }
+
+  const onUpdateAvailable = (info: { version: string; current: string;
+                                      rollback: boolean }) => {
+    try {
+      const msg = info.rollback
+        ? `Kickbacks: rolling back to v${info.version} (from v${info.current})…`
+        : `Kickbacks: v${info.version} available — installing now…`;
+      void vscode.window.showInformationMessage?.(msg);
+    } catch { /* toast best-effort */ }
+  };
+
+  const updater = new UpdateClient(updateBase, currentVersion, fetch, installVsix, {
+    attempted: (v, sha) => ringSeen(ctx, UPD_KEY, updKey(v, sha), UPD_COOLDOWN_MS),
+    markAttempted: (v, sha) => { ringMark(ctx, UPD_KEY, updKey(v, sha)); },
+    transientFailed: (v, sha) =>
+      ringSeen(ctx, UPD_TRANSIENT_KEY, updKey(v, sha), UPD_TRANSIENT_COOLDOWN_MS),
+    markTransientFailed: (v, sha) => { ringMark(ctx, UPD_TRANSIENT_KEY, updKey(v, sha)); },
+    recordLkg: (v, vsix) => {
+      try {
+        const lkgPath = join(tmpdir(), `kickbacks-lkg-${v}.vsix`);
+        writeFileSync(lkgPath, vsix);
+        void ctx.globalState.update("vibe-ads.update.lkg", { v, path: lkgPath });
+      } catch { /* best-effort */ }
+    },
+  }, onUpdateAvailable);
+
+  timers.push(setInterval(() => void updater.checkOnce(),
+    updatePollIntervalMs || DEFAULT_POLL_MS));
+
+  return { updater, installVsix };
+}

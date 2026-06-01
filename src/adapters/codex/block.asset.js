@@ -1,0 +1,440 @@
+(function () {
+  "use strict";
+  // Injected as the first statement of Codex's ThinkingShimmer entry:
+  //   function v(e){ e=(<THIS IIFE>)||e; ... }
+  // It ALWAYS returns undefined → `e = undefined || e` → Codex's component
+  // runs completely untouched. We do NOT swap e.message / return a JSX
+  // element: any mutation of (or substitution into) Codex's React-Compiler
+  // tree is torn out on the next reconcile (the finnicky no-render). Instead,
+  // exactly like the proven Claude Code block, we read Codex's thinking row
+  // READ-ONLY and paint the ad in OUR OWN element appended to <body>, OUTSIDE
+  // React's roots. Rendering is pure DOM (no network) so it works even though
+  // Codex's webview CSP blocks the loopback fetch (telemetry/billing only).
+  // Any throw is swallowed and undefined returned — Codex must never break.
+  try {
+    if (window.__vibeAdsCodexBoot) return undefined;   // one bootstrap / webview
+    window.__vibeAdsCodexBoot = 1;
+  } catch (e) { return undefined; }
+  try {
+    var AD = __VIBE_ADS_AD__;
+    var CLICKURL = __VIBE_ADS_CLICKURL__;
+    var CLICKTOKEN = __VIBE_ADS_CLICKTOKEN__;
+    var CORR = __VIBE_ADS_CORR__, DEBUG = __VIBE_ADS_DEBUG__;
+    var PORT = __VIBE_ADS_PORT__, LBTOKEN = __VIBE_ADS_LBTOKEN__;
+    var BASE = __VIBE_ADS_BASE__ ||
+      ("http://127.0.0.1:" + PORT + "/vibe-ads/" + LBTOKEN);
+    var GRACE_MS = 1500;
+
+    function esc(s) {
+      return String(s).replace(/[&<>"]/g, function (c) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+      });
+    }
+    function ell(f) { return ["", " .", " ..", " ..."][f % 4]; }
+    function elp(ms) { return (ms / 1000).toFixed(1) + "s"; }
+    function dlog(evt, data) {
+      if (!DEBUG) return;
+      try {
+        var o = { evt: evt, corr: CORR, t: "codex" };
+        if (data) for (var k in data) o[k] = data[k];
+        fetch(BASE + "/log", { method: "POST", keepalive: true,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(o) }).catch(function () {});
+      } catch (e) {}
+    }
+    function ping(kind) {
+      try {
+        fetch(BASE + "/" + kind, { method: "POST", keepalive: true })
+          .catch(function () {});
+      } catch (e) {}
+    }
+    function newEventUuid() {
+      try {
+        if (typeof crypto !== "undefined"
+            && typeof crypto.randomUUID === "function") {
+          return crypto.randomUUID();
+        }
+      } catch (e) { /* fall through */ }
+      try {
+        return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,
+          function (c) {
+            var r = Math.random() * 16 | 0;
+            var v = c === "x" ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+          });
+      } catch (e) { return "evt-" + Date.now() + "-" + Math.random(); }
+    }
+    dlog("codex.boot", { href: String(location.href).slice(0, 80) });
+
+    // ---- W3 view-time accumulator (mirrors claude-code/block.asset.js) -----
+    // An ad must accumulate THRESHOLD_MS of cumulative visible time on the
+    // codex_overlay surface before it counts as a billable view. Threshold
+    // is server-overridable via /v1/portfolio.view_threshold_seconds, baked
+    // into the block as __VIBE_ADS_VIEW_THRESHOLD_MS__ (fallback 15s). Pure
+    // best-effort: any throw is swallowed.
+    var THRESHOLD_MS = (typeof __VIBE_ADS_VIEW_THRESHOLD_MS__ === "number"
+      && __VIBE_ADS_VIEW_THRESHOLD_MS__ > 0)
+      ? __VIBE_ADS_VIEW_THRESHOLD_MS__ : 15000;
+    var TICK_MS = 5000;
+    // MAX_SESSION_MS billing cap: fire `error_impression` at EVERY
+    // multiple of this elapsed mark. See claude-code/block.asset.js for
+    // the full rationale.
+    var MAX_SESSION_MS = 5000;
+    var SESSION_NONCE = (function () {
+      try {
+        return (Math.random().toString(36).slice(2)
+          + Math.random().toString(36).slice(2)).slice(0, 16);
+      } catch (e) { return "s" + Date.now(); }
+    })();
+    var _vt = Object.create(null);
+    function vtKey(adId, surface) { return surface + ":" + adId; }
+    function viewShow(adId, surface) {
+      if (!adId) return;
+      var k = vtKey(adId, surface);
+      var s = _vt[k];
+      if (!s) {
+        // Sticky sessionStartedAt — repeat viewShow() with same nonce
+        // does NOT restart the baseline. errorImpressionCount tracks
+        // how many error_impressions have fired; the next one fires at
+        // `(count+1) * MAX_SESSION_MS`.
+        _vt[k] = { adId: adId, surface: surface,
+          sessionNonce: SESSION_NONCE,
+          sessionStartedAt: Date.now(),
+          lastTickMs: 0, thresholdMet: false,
+          errorImpressionCount: 0 };
+      }
+    }
+    function viewHide(_adId, _surface) {
+      // No-op under absolute-epoch baseline (see claude-code/block.asset.js).
+    }
+    function viewMaybeEmit(s) {
+      var elapsed = Math.max(0, Date.now() - s.sessionStartedAt);
+      var tickFired = false;
+      while (elapsed - s.lastTickMs >= TICK_MS) {
+        s.lastTickMs += TICK_MS;
+        tickFired = true;
+        var tickEventUuid = newEventUuid();
+        var q = "?surface=" + encodeURIComponent(s.surface)
+          + "&ad=" + encodeURIComponent(s.adId)
+          + "&visible_ms=" + s.lastTickMs
+          + "&session=" + encodeURIComponent(s.sessionNonce)
+          + "&event_uuid=" + encodeURIComponent(tickEventUuid);
+        ping("view_tick" + q);
+      }
+      // Mutex: threshold_met only fires when no error_impression has
+      // fired this session. With default cap=5s/threshold=15s this
+      // means threshold_met effectively never fires for Codex either.
+      if (!s.thresholdMet && s.errorImpressionCount === 0
+          && elapsed >= THRESHOLD_MS) {
+        s.thresholdMet = true;
+        var thresholdEventUuid = newEventUuid();
+        var q2 = "?surface=" + encodeURIComponent(s.surface)
+          + "&ad=" + encodeURIComponent(s.adId)
+          + "&visible_ms=" + elapsed
+          + "&threshold_ms=" + THRESHOLD_MS
+          + "&session=" + encodeURIComponent(s.sessionNonce)
+          + "&event_uuid=" + encodeURIComponent(thresholdEventUuid);
+        dlog("codex.view.threshold_met", { adId: s.adId, surface: s.surface,
+          visibleMs: elapsed, eventUuid: thresholdEventUuid });
+        ping("view_threshold_met" + q2);
+      }
+      var nextFireAt = (s.errorImpressionCount + 1) * MAX_SESSION_MS;
+      if (!tickFired && !s.thresholdMet && elapsed >= nextFireAt) {
+        s.errorImpressionCount += 1;
+        var errorEventUuid = newEventUuid();
+        var q3 = "?surface=" + encodeURIComponent(s.surface)
+          + "&ad=" + encodeURIComponent(s.adId)
+          + "&visible_ms=" + elapsed
+          + "&max_session_ms=" + MAX_SESSION_MS
+          + "&fire=" + s.errorImpressionCount
+          + "&session=" + encodeURIComponent(s.sessionNonce)
+          + "&event_uuid=" + encodeURIComponent(errorEventUuid);
+        dlog("codex.view.error_impression", { adId: s.adId,
+          surface: s.surface, visibleMs: elapsed,
+          fire: s.errorImpressionCount, eventUuid: errorEventUuid });
+        ping("error_impression" + q3);
+      }
+    }
+    function viewTick() {
+      try {
+        for (var k in _vt) viewMaybeEmit(_vt[k]);
+      } catch (e) {}
+    }
+    setInterval(viewTick, 250);
+    // Click-threshold companion: snapshot the running visible_ms for an
+    // ad+surface so the extension loopback can apply a floor (clicks
+    // before X ms of cumulative visible time get logged but not billed).
+    function viewVisibleMsNow(adId, surface) {
+      try {
+        var s = _vt[vtKey(adId, surface)];
+        if (!s) return 0;
+        return Math.max(0, Date.now() - s.sessionStartedAt);
+      } catch (e) { return 0; }
+    }
+    // visibilitychange flush removed: under the absolute-epoch baseline a
+    // hidden webview keeps counting. The mutex (one bill per session) +
+    // server-side cooldown gate bound the worst case to one bill per ad
+    // per cooldown window.
+
+    var FG = "var(--vscode-foreground,currentColor)";
+    var DIM = "var(--vscode-descriptionForeground,currentColor)";
+    var FAV = '<svg width="13" height="13" viewBox="0 0 13 13" ' +
+      'aria-hidden="true" style="vertical-align:middle;border-radius:3px;' +
+      'flex:0 0 auto"><rect width="13" height="13" rx="3" fill="#188a45"/>' +
+      '<text x="6.5" y="9.6" font-size="9" font-family="monospace" ' +
+      'font-weight="700" text-anchor="middle" fill="#fff">K</text></svg>';
+    function buildAd(dots, elapsed) {
+      var href = /^https?:\/\//i.test(CLICKURL || "") ? esc(CLICKURL) : "#";
+      // Favicon lives INSIDE the anchor (matches CC's adapter shape) so a
+      // probe like `[data-vibe-ads-ad] svg` finds it — the row 08 / 09
+      // adHasFavicon check used to fail because the SVG was a sibling of
+      // the anchor, not a descendant. Visual is unchanged: favicon stays
+      // immediately left of the ad text, just now part of the link
+      // (clicking the favicon now navigates, which is the desired UX).
+      var A = '<a href="' + href + '" target="_blank" rel="noopener noreferrer" ' +
+        'data-vibe-ads-ad="1" style="display:inline-flex;align-items:center;' +
+        'gap:7px;color:' + FG +
+        ';text-decoration:underline;overflow:hidden;text-overflow:ellipsis">' +
+        FAV + esc(AD) + '<span style="display:inline-block;width:3ch;' +
+        'text-align:left;white-space:pre">' + esc(dots) + "</span></a>";
+      var left = '<span style="display:flex;align-items:center;gap:7px;' +
+        'color:' + FG + ';min-width:0">' + A + "</span>";
+      var right = '<span style="font-size:11px;color:' + DIM +
+        ';flex:0 0 auto;margin-left:auto;padding-left:24px;' +
+        'font-variant-numeric:tabular-nums">' + esc(elapsed) + "</span>";
+      return '<span style="display:flex;align-items:center;width:100%;' +
+        'box-sizing:border-box;padding:0 4px;justify-content:flex-start;' +
+        'white-space:nowrap">' + left + right + "</span>";
+    }
+
+    // Locate Codex's thinking-shimmer line READ-ONLY. The entry component `v`
+    // renders its text span with the stable class combo
+    // `text-size-chat … select-none truncate` (from the chunk:
+    // o=s("text-size-chat leading-[1.5] select-none truncate", className)).
+    // Require ALL THREE tokens so nothing else in the chat ever matches —
+    // and since we only READ its rect (never mutate it) a mis-match is at
+    // worst a cosmetic mispaint, never a prime-directive violation.
+    //
+    // ALSO require `loading-shimmer` (the live sweep marker) and a non-zero
+    // bounding rect. Codex 26.x keeps the post-turn "Thinking 1.2s" summary
+    // chip in the chat history with the SAME `text-size-chat truncate
+    // select-none` class combo and textContent "Thinking 1.2s", but as a
+    // display:none / hidden element — it does NOT carry `loading-shimmer-*`.
+    // Without the extra anchors the old predicate matched the static history
+    // chip and `isThinkingRow()` returned true forever — overlay never
+    // released at idle (row 03 regression) and stuck to turn 1 on multi-
+    // turn prompts (row 08, "glued to turn 1").
+    function findRow() {
+      var els = document.querySelectorAll(
+        '[class*="text-size-chat"][class*="truncate"]');
+      for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (el.nodeType !== 1) continue;
+        var c = " " + (el.className || "") + " ";
+        if (c.indexOf("select-none") === -1) continue;
+        if (c.indexOf("loading-shimmer") === -1) continue;
+        var r = el.getBoundingClientRect && el.getBoundingClientRect();
+        if (!r || (!r.width && !r.height)) continue;
+        // Honour visibility / opacity. Codex 26.x keeps the live shimmer
+        // element mounted briefly with `visibility:hidden` between the
+        // text-stream-end and the React unmount, so the row is technically
+        // present (rect non-zero, class trio still on) but invisible —
+        // exactly the post-stream state row 03 / codexBusy treat as
+        // "idle." Without this guard the overlay keeps painting on a
+        // hidden shimmer and isAnimating() catches our dot-cycle frames.
+        try {
+          var cs = window.getComputedStyle && window.getComputedStyle(el);
+          if (cs) {
+            if (cs.visibility === "hidden" || cs.display === "none") continue;
+            if (parseFloat(cs.opacity || "1") < 0.05) continue;
+          }
+        } catch (e) { /* jsdom / detached frame: fall through, pass */ }
+        return el;
+      }
+      return null;
+    }
+    // §4.4 gate, DOM-driven: show ONLY when the row is Codex's GENERIC
+    // "Thinking" placeholder. A real tool/approval/reasoning status renders
+    // different text (e.g. "Reading …", "Running …") → we yield (no overlay).
+    //
+    // Codex 26.x renders the shimmer as TWO stacked spans (base + sweep
+    // highlight overlay) so textContent concatenates to "ThinkingThinking".
+    // The previous /^thinking\b/i predicate failed against that string
+    // because `\b` requires a non-word char after "thinking" and the next
+    // char (`T`) is a word char — that was the regression causing rows
+    // 02 / 08 / 09 sawAd:false. Drop the word-boundary and rely on the
+    // length cap + the class-trio anchor in findRow().
+    function isThinkingRow(el) {
+      if (!el) return false;
+      var t = (el.textContent || "").trim();
+      // Empty was previously treated as "shimmer mounted, text incoming"
+      // but it's ALSO the post-completion state where Codex unmounts
+      // the text but leaves the wrapper span. That ambiguity made the
+      // ad linger past streaming (row 03 idle-release regression).
+      // Require an explicit "thinking" prefix; the transient empty
+      // window is brief enough that the GRACE_MS=1500 idle timer
+      // handles re-paint on subsequent turns without leaking idle paint.
+      if (!t) return false;
+      // accept "Thinking", "ThinkingThinking" (duplicated-span case),
+      // "Thinking…", "Thinking 1.2s" — all start with "thinking".
+      var lc = t.toLowerCase();
+      return lc.length <= 32 && lc.indexOf("thinking") === 0;
+    }
+    function surfaceBg(el) {
+      // The overlay sits on top of the "Thinking" row, so a transparent
+      // bg would let the underlying verb text bleed through. We need a
+      // colour, and it must match the surrounding chat-panel surface.
+      // The old strategy (first non-transparent ancestor) grabbed
+      // intermediate wrappers — chat bubble surfaces, hover tints —
+      // which differ in shade from the visible panel and made the ad
+      // look like a patch. Preferred chain:
+      //   1. nearest SCROLLABLE ancestor's bg (== the visible panel)
+      //   2. document.body's computed bg (== VS Code's webview theme)
+      //   3. CSS var fallback (theme-aware even when computed values
+      //      aren't resolvable, e.g. detached frames)
+      try {
+        var n = el, hops = 0;
+        while (n && n.nodeType === 1 && hops++ < 20) {
+          var cs = window.getComputedStyle(n) || {};
+          var ov = cs.overflowY || cs.overflow;
+          if (ov === "auto" || ov === "scroll") {
+            var bg = cs.backgroundColor;
+            if (bg && bg !== "transparent" && bg !== "rgba(0, 0, 0, 0)")
+              return bg;
+            break;          // found the panel; its bg is transparent
+          }
+          n = n.parentElement;
+        }
+        var bodyBg = (window.getComputedStyle(document.body) || {})
+          .backgroundColor;
+        if (bodyBg && bodyBg !== "transparent"
+          && bodyBg !== "rgba(0, 0, 0, 0)") return bodyBg;
+      } catch (e) {}
+      return "var(--vscode-sideBar-background,"
+        + "var(--vscode-editor-background,#1e1e1e))";
+    }
+
+    // Click-out: the anchor's real http(s) href is what the VS Code webview
+    // host opens externally (CSP-exempt) — the only click that survives
+    // Codex's `default-src 'none'`. Do NOT preventDefault. The ping is
+    // best-effort billing (revived by the Codex connect-src patch).
+    document.addEventListener("click", function (ev) {
+      var el = ev.target;
+      while (el && el !== document) {
+        if (el.getAttribute && el.getAttribute("data-vibe-ads-ad")) {
+          var vms = viewVisibleMsNow(AD, "codex_overlay");
+          var clickEventUuid = newEventUuid();
+          dlog("codex.click", { ct: CLICKTOKEN, visibleMs: vms,
+            eventUuid: clickEventUuid });
+          ping("click?ct=" + encodeURIComponent(CLICKTOKEN) +
+            "&corr=" + encodeURIComponent(CORR) +
+            "&surface=codex_overlay" +
+            "&visible_ms=" + vms +
+            "&event_uuid=" + encodeURIComponent(clickEventUuid));
+          return;
+        }
+        el = el.parentNode;
+      }
+    }, true);
+
+    var overlay = null, lastRow = null, lastSeenMs = 0, _rect = "";
+    var t0 = 0, frameN = 0, _shown = false, _sent = false;
+    function ensureOverlay(row) {
+      if (overlay && overlay.parentNode) return overlay;
+      overlay = document.createElement("div");
+      overlay.setAttribute("data-vibe-ads", "codex");
+      overlay.style.cssText =
+        "position:fixed;z-index:2147483646;pointer-events:auto;" +
+        "display:flex;align-items:center;box-sizing:border-box;" +
+        "overflow:hidden;white-space:nowrap;visibility:hidden;background:" +
+        surfaceBg(row);
+      try { (document.body || document.documentElement).appendChild(overlay); }
+      catch (e) {}
+      return overlay;
+    }
+    function placeOverlay(row) {
+      try {
+        var r = row.getBoundingClientRect();
+        if (r && (r.width || r.height || r.top || r.left)) {
+          var key = r.left + "," + r.top + "," + r.width + "," + r.height;
+          if (key !== _rect) {
+            _rect = key;
+            overlay.style.left = r.left + "px";
+            overlay.style.top = r.top + "px";
+            overlay.style.minWidth = r.width + "px";
+            overlay.style.height = r.height + "px";
+            overlay.style.visibility = "visible";
+          }
+        }
+      } catch (e) {}
+    }
+    function dropOverlay() {
+      try { viewHide(AD, "codex_overlay"); } catch (e) {}
+      try { if (overlay && overlay.parentNode)
+        overlay.parentNode.removeChild(overlay); } catch (e) {}
+      overlay = null; lastRow = null; _rect = ""; _shown = false; _sent = false;
+    }
+    function paint(row) {
+      var now = Date.now();
+      if (!t0) t0 = now;
+      lastRow = row; lastSeenMs = now;
+      frameN++;
+      if (!_shown) { _shown = true;
+        dlog("codex.show", { cls: String(row.className || "").slice(0, 60) }); }
+      if (!_sent) { _sent = true;
+        ping("impression_rendered?surface=codex_overlay&ad="
+          + encodeURIComponent(AD)
+          + "&event_uuid=" + encodeURIComponent(newEventUuid()));
+        var vis = (typeof document.hidden === "undefined")
+          ? true : !document.hidden;
+        if (vis) {
+          ping("impression_viewable?surface=codex_overlay&ad="
+            + encodeURIComponent(AD)
+            + "&event_uuid=" + encodeURIComponent(newEventUuid()));
+        }
+      }
+      try { viewShow(AD, "codex_overlay"); } catch (e) {}
+      var o = ensureOverlay(row);
+      placeOverlay(row);
+      var html = buildAd(ell(Math.floor(frameN / 3)), elp(now - t0));
+      if (o.innerHTML !== html) o.innerHTML = html;     // OUR node only
+    }
+    function frame() {
+      try {
+        if (overlay && lastRow && lastRow.isConnected) placeOverlay(lastRow);
+      } catch (e) {}
+      try { window.requestAnimationFrame(frame); }
+      catch (e) { setTimeout(frame, 16); }
+    }
+    try { window.requestAnimationFrame(frame); }
+    catch (e) { setTimeout(frame, 16); }
+
+    setInterval(function () {
+      try {
+        var now = Date.now();
+        var row = findRow();
+        if (row && isThinkingRow(row)) {
+          paint(row);
+        } else if (overlay && (now - lastSeenMs) > GRACE_MS) {
+          dlog("codex.idle", { sinceMs: now - lastSeenMs });
+          dropOverlay(); t0 = 0; frameN = 0;
+        }
+      } catch (e) {
+        dlog("codex.looperr",
+          { msg: String(e && e.message || e).slice(0, 160) });
+      }
+    }, 80);
+  } catch (__vibeads) {
+    try {
+      var D = __VIBE_ADS_DEBUG__, C = __VIBE_ADS_CORR__,
+        B = __VIBE_ADS_BASE__ || ("http://127.0.0.1:" + __VIBE_ADS_PORT__ +
+          "/vibe-ads/" + __VIBE_ADS_LBTOKEN__);
+      if (D) fetch(B + "/log", { method: "POST", keepalive: true,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ evt: "codex.throw", corr: C, t: "codex",
+          msg: String(__vibeads && __vibeads.message || __vibeads)
+            .slice(0, 140) }) }).catch(function () {});
+    } catch (e) {}
+  }
+  return undefined;                 // ALWAYS — Codex's component untouched
+})()

@@ -1,0 +1,141 @@
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="media/logos/kickbacks-white.svg">
+  <source media="(prefers-color-scheme: light)" srcset="media/logos/kickbacks-green.svg">
+  <img alt="Kickbacks" src="media/logos/kickbacks.svg" width="320">
+</picture>
+
+### Get paid while you code.
+
+**Kickbacks** sells the little "thinking…" word inside the Claude Code & Codex
+spinners — and pays **half of every ad dollar back to you**, the developer whose
+machine showed it.
+
+[![Website](https://img.shields.io/badge/kickbacks.ai-00B894?style=for-the-badge&logoColor=white)](https://kickbacks.ai)
+[![VS Code Marketplace](https://img.shields.io/badge/VS%20Code-Install-007ACC?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://marketplace.visualstudio.com/items?itemName=Kickbacksai.kickbacks-ai)
+[![License](https://img.shields.io/badge/license-Source--Available-lightgrey?style=for-the-badge)](LICENSE)
+
+</div>
+
+---
+
+## 💡 The idea
+
+When Claude Code or Codex is thinking, it shows a random verb — *"Discombobulating…"*,
+*"Baking…"*, *"Percolating…"*. Cute, but it's prime real estate doing nothing.
+
+Kickbacks turns that one line into a tiny, tasteful, **clickable** sponsored slot.
+Advertisers bid for it in an open auction. You get **50% of every dollar** they spend
+— credited automatically, per impression and per click.
+
+```diff
+- ✶ Discombobulating… (esc to interrupt)
++ ✶ Linear — issue tracking that's actually fast ↗ (esc to interrupt)
+```
+
+No surveys. No crypto. No "watch this video." You just… keep coding, and your
+balance ticks up in the status bar:
+
+```
+Kickbacks  ($0.42 today · $7.11)
+```
+
+## 🤝 How the money works
+
+- **Advertisers buy blocks.** One block = **1,000 five-second impressions**. They set
+  a price per block and an ad creative, then buy as many blocks as they want.
+- **An English-ascending auction** decides whose ad shows where, and when.
+- **50 / 50 split.** Half of every settled dollar accrues to the developer whose
+  editor rendered the ad. Clicks are worth **50×** an impression.
+- **Real-time balance.** Today / this month / lifetime, right in your VS Code
+  status bar, with a full ledger at [kickbacks.ai](https://kickbacks.ai).
+
+## 🛡️ The Prime Directive: never break your editor
+
+This is the rule everything else bends around.
+
+- **Byte-reversible.** Patches are applied from a byte-exact backup. *Restore Claude
+  Code* from the menu reverts everything, byte-for-byte, any time.
+- **Per-version preflight.** The extension refuses to touch any build it doesn't
+  recognize. Unknown version? It does nothing. Stock verbs stay.
+- **Zero code access.** Kickbacks never reads your code, prompts, completions, or
+  chat content — only the spinner display text changes.
+- **Kill-switch.** A server-controlled global off-switch can stand the whole fleet
+  down instantly.
+
+> If Kickbacks can't find a target it's 100% sure about, it stays out of the way.
+> It will never break your editor or your terminal.
+
+## 🎯 Where the ad shows up
+
+Four surfaces, one extension:
+
+| Surface | Where | Needs |
+| --- | --- | --- |
+| **Spinner overlay** | Claude Code VS Code panel | A compatible extension build |
+| **Thinking-shimmer** | Codex VS Code panel | A compatible extension build |
+| **Status-bar line** | Claude Code terminal CLI | Any Claude Code version |
+| **Spinner verb** | Claude Code terminal CLI | Claude Code **2.1.143+** |
+
+VS Code surfaces work on local, Remote-SSH, devcontainers, and code-server.
+Older CLIs just keep their stock verbs — nothing breaks.
+
+## 🚀 Install
+
+1. Search **Kickbacks** in the VS Code Marketplace and install.
+2. Click **Kickbacks: Sign in** in the status bar.
+3. Authenticate with Google.
+4. Keep coding. Earnings start automatically.
+
+→ **[Get it on the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Kickbacksai.kickbacks-ai)**
+
+## 📣 Want to advertise?
+
+You're buying attention from the most technical audience on earth, in the calmest
+possible format — a single line, while they wait. Set your bid, drop in a creative,
+and you're live.
+
+→ **[Buy inventory at kickbacks.ai](https://kickbacks.ai)**
+
+## 🧱 What's in this repo
+
+This is a **public, read-only mirror** of the Kickbacks VS Code extension — the
+client that renders the ads and tracks impressions. It's published for
+transparency: you can read exactly what runs on your machine.
+
+```
+src/
+  adapters/        per-tool injection (claude-code, codex, claude-cli, codex-cli)
+  activation/      lifecycle: ad rotation, self-update, status bar, injection
+  auth/            sign-in + OS-keychain-sealed token vault
+  metrics/         impression / view-threshold / click telemetry (idempotent)
+  viewTracking/    "was it actually on screen for 3s?" timer
+  killswitch/      server-controlled global off-switch
+media/             logos + icons
+test/              the vitest suite that guards the Prime Directive
+```
+
+The backend, advertiser portal, auction engine, and marketing site live in a
+separate private repository.
+
+### Build it yourself
+
+```bash
+npm install
+npm run build       # esbuild → dist/
+npm test            # vitest — the safety net for the Prime Directive
+npm run package     # produce the .vsix
+```
+
+## 📜 License
+
+**Proprietary and source-available — _not_ open source.** © 2026 ShiftKeys, Inc.
+All rights reserved. You may read this code; you may **not** use, copy, modify,
+distribute, or commercialize it without a written license. See [LICENSE](LICENSE).
+Commercial inquiries: **andrew@shiftkeys.ai**.
+
+<div align="center">
+<br>
+<sub>Made with caffeine by <a href="https://kickbacks.ai">ShiftKeys</a> · half the ad money is yours.</sub>
+</div>
