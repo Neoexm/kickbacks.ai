@@ -89,6 +89,25 @@ function readTranscriptEntrypoint(path: string): string | null {
   } catch { return null; }
 }
 
+// Mtime-sorted (newest first) scan of every transcript under
+// ~/.claude/projects — shared by the per-surface resolvers below.
+function scanTranscripts(): { p: string; m: number }[] {
+  const root = join(homedir(), ".claude", "projects");
+  if (!existsSync(root)) return [];
+  const cands: { p: string; m: number }[] = [];
+  for (const proj of readdirSync(root)) {
+    let entries: string[];
+    try { entries = readdirSync(join(root, proj)); } catch { continue; }
+    for (const f of entries) {
+      if (!f.endsWith(".jsonl")) continue;
+      const p = join(root, proj, f);
+      try { cands.push({ p, m: statSync(p).mtimeMs }); } catch { /* ignore */ }
+    }
+  }
+  cands.sort((a, b) => b.m - a.m);
+  return cands;
+}
+
 // Discover Claude Code's live JSONL transcript. CRITICAL: multiple Claude
 // sessions can share a cwd (e.g. an interactive VS Code session AND a CLI/
 // agent session). "Newest jsonl" alone tails whichever moved last — often the
@@ -102,20 +121,8 @@ export function locateClaudeCodeLog(): string {
     || process.env.VIBE_ADS_CC_LOG;
   if (explicit && existsSync(explicit)) return explicit;
   try {
-    const root = join(homedir(), ".claude", "projects");
-    if (!existsSync(root)) return "";
-    const cands: { p: string; m: number }[] = [];
-    for (const proj of readdirSync(root)) {
-      let entries: string[];
-      try { entries = readdirSync(join(root, proj)); } catch { continue; }
-      for (const f of entries) {
-        if (!f.endsWith(".jsonl")) continue;
-        const p = join(root, proj, f);
-        try { cands.push({ p, m: statSync(p).mtimeMs }); } catch { /* ignore */ }
-      }
-    }
+    const cands = scanTranscripts();
     if (!cands.length) return "";
-    cands.sort((a, b) => b.m - a.m);
     // Documented filter (audit #24): newest transcript positively tagged
     // entrypoint:"claude-vscode" wins; fall back to the newest UNTAGGED one
     // (older CC builds); when every probed candidate is tagged as another
@@ -132,5 +139,25 @@ export function locateClaudeCodeLog(): string {
       if (tag === null && !newestUntagged) newestUntagged = c.p;
     }
     return newestUntagged;
+  } catch { return ""; }
+}
+
+// The TERMINAL-side mirror of locateClaudeCodeLog: newest transcript
+// positively tagged entrypoint:"cli" (a `claude` TUI session), "" when none.
+// This deliberately does NOT claim untagged transcripts — those stay with the
+// strict resolver's fallback so the two signals never double-claim a file.
+// Consumers: the statusbar ad's terminal-activity signal and the statusline
+// view-tick loop (the fix for "TUI-only users see ads all day but the
+// statusbar/billing surface never engages" — locateClaudeCodeLog correctly
+// returns "" for them, by design, for the overlay/desync watchdog's sake).
+export function locateClaudeCliLog(): string {
+  const explicit = process.env.KICKBACKS_CLI_LOG;
+  if (explicit && existsSync(explicit)) return explicit;
+  try {
+    const cands = scanTranscripts();
+    for (const c of cands.slice(0, 20)) {
+      if (transcriptEntrypoint(c.p) === "cli") return c.p;
+    }
+    return "";
   } catch { return ""; }
 }

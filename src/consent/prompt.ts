@@ -25,42 +25,49 @@ export interface ConsentPromptOptions {
 
 export async function maybePromptForConsent(opts: ConsentPromptOptions): Promise<void> {
   const { client, ctx, vsc, dlog } = opts;
-  const state = await client.read();
-  if (state === null) return; // signed out or backend unreachable; try later
-  // Already consented to the live version → nothing to do.
-  if (state.telemetryOptIn
-      && state.tosAcceptedVersion === state.currentTosVersion) {
-    return;
-  }
-  const shownFor = ctx.globalState.get<string>(SHOWN_KEY);
-  if (shownFor === state.currentTosVersion) {
-    // Already nagged for this version this session/process; defer to next.
-    return;
-  }
-  dlog?.(`consent.prompt show version=${state.currentTosVersion}`);
-  const pick = await vsc.window.showInformationMessage(
-    "Kickbacks shows subtle ads in the Claude Code spinner and splits "
-    + "50/50 of every settled dollar back to you. Telemetry is opt-in. "
-    + "Continue?",
-    { modal: false },
-    "Agree",
-    "Privacy Policy",
-  );
-  if (pick === "Agree") {
-    const result = await client.accept();
-    dlog?.(`consent.prompt accept result=${result ? "ok" : "fail"}`);
-    if (result) {
-      // Mark shown only after successful POST to avoid stranding the user
-      // in a partial-accept state.
-      void ctx.globalState.update(SHOWN_KEY, result.tosVersion);
+  // The caller fires this without awaiting (`void maybePromptForConsent(...)`)
+  // — a rejection anywhere below would surface as an unhandledRejection, so
+  // the whole body is guarded. Consent prompting is best-effort by contract.
+  try {
+    const state = await client.read();
+    if (state === null) return; // signed out or backend unreachable; try later
+    // Already consented to the live version → nothing to do.
+    if (state.telemetryOptIn
+        && state.tosAcceptedVersion === state.currentTosVersion) {
+      return;
     }
-    return;
+    const shownFor = ctx.globalState.get<string>(SHOWN_KEY);
+    if (shownFor === state.currentTosVersion) {
+      // Already nagged for this version this session/process; defer to next.
+      return;
+    }
+    dlog?.(`consent.prompt show version=${state.currentTosVersion}`);
+    const pick = await vsc.window.showInformationMessage(
+      "Kickbacks shows subtle ads in the Claude Code spinner and splits "
+      + "50/50 of every settled dollar back to you. Telemetry is opt-in. "
+      + "Continue?",
+      { modal: false },
+      "Agree",
+      "Privacy Policy",
+    );
+    if (pick === "Agree") {
+      const result = await client.accept();
+      dlog?.(`consent.prompt accept result=${result ? "ok" : "fail"}`);
+      if (result) {
+        // Mark shown only after successful POST to avoid stranding the user
+        // in a partial-accept state.
+        void ctx.globalState.update(SHOWN_KEY, result.tosVersion);
+      }
+      return;
+    }
+    if (pick === "Privacy Policy") {
+      void vsc.env.openExternal(vsc.Uri.parse(PRIVACY_URL));
+      // Don't mark shown — surface again next session.
+      return;
+    }
+    // Dismissed -> set "shown" for this version so we don't pester.
+    void ctx.globalState.update(SHOWN_KEY, state.currentTosVersion);
+  } catch (e) {
+    dlog?.(`consent.prompt error: ${e instanceof Error ? e.message : String(e)}`);
   }
-  if (pick === "Privacy Policy") {
-    void vsc.env.openExternal(vsc.Uri.parse(PRIVACY_URL));
-    // Don't mark shown — surface again next session.
-    return;
-  }
-  // Dismissed -> set "shown" for this version so we don't pester.
-  void ctx.globalState.update(SHOWN_KEY, state.currentTosVersion);
 }

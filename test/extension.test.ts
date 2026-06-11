@@ -6,8 +6,9 @@ import { describe, it, expect, vi } from "vitest";
 // noise interleaved with the user's real extension events, which was
 // misdiagnosed once as an extension restart loop.
 vi.mock("../src/log", () => ({ debugEnabled: () => false, dlog: () => {},
-  dlogRaw: () => {}, codexEnabled: () => false, codexCliEnabled: () => false,
-  testHooksEnabled: () => false,
+  dlogRaw: () => {}, codexEnabled: () => false, codexDisabled: () => false,
+  codexCliEnabled: () => false, testHooksEnabled: () => false,
+  debugIconDataUri: () => "",
   LOG_PATH: "/tmp/test-log" }));
 
 // Hermetic ~/.claude/settings.json: activate() wires the claude-cli
@@ -29,9 +30,31 @@ vi.mock("../src/adapters/claude-cli/adapter", () => ({
   },
 }));
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { activate, deactivate, __wireForTest } from "../src/extension";
-import { makeContext, _warned } from "./mocks/vscode";
+import { makeContext, _warned, commands } from "./mocks/vscode";
 import { ImpressionDedupe } from "../src/metrics/dedupe";
+
+/** Redirect HOME/USERPROFILE to a fresh temp dir for one test: hermetic
+ *  ~/.vibe-ads/boot.canary (a lingering real-home canary < 90s old reads as
+ *  a crash and suspends auto-enable) and a guaranteed-empty extension scan
+ *  for the codex strand-restore's locateCodexTarget(). */
+function tempHome() {
+  const home = mkdtempSync(join(tmpdir(), "kb-ext-home-"));
+  const prevHome = process.env.HOME;
+  const prevUser = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;   // os.homedir() reads this on Windows
+  return () => {
+    if (prevHome !== undefined) process.env.HOME = prevHome;
+    else delete process.env.HOME;
+    if (prevUser !== undefined) process.env.USERPROFILE = prevUser;
+    else delete process.env.USERPROFILE;
+    try { rmSync(home, { recursive: true, force: true }); } catch { /* ok */ }
+  };
+}
 
 it("loopback impression path dedupes per adId (one bill per ad)", () => {
   const d = new ImpressionDedupe();
@@ -225,6 +248,98 @@ describe("extension orchestration", { timeout: 15_000 }, () => {
     await deactivate();
     expect(adapter.restore, "deactivate must restore when K_ON is false")
       .toHaveBeenCalled();
+  });
+
+  it("codex-only: activation proceeds, K_ON persists, codex/<ver> on the wire,"
+    + " never labeled incompatible", async () => {
+    // The bug a public-mirror PR reported (kickbacks.ai#1): Claude Code
+    // absent (preflight "target not found") + a compatible Codex install
+    // used to hit the claude-only preflight early-return — red
+    // "incompatible" bar, no sign-in command, no serving, K_ON never
+    // persisted. Activation must now proceed on the codex leg alone.
+    const restoreHome = tempHome();
+    const adapter = {
+      name: "claude-code",
+      preflight: () => ({ ok: true, compatible: false, version: null,
+        reason: "target not found" }),
+      version: () => null,
+      applyPatch: vi.fn(() => ({ ok: false, reason: "target not found" })),
+      restore: vi.fn(() => ({ ok: true, restored: false })),
+    };
+    const codexAdapter = {
+      name: "codex",
+      preflight: () => ({ ok: true, compatible: true, version: "26.513.21555" }),
+      version: () => "26.513.21555",
+      isPatched: vi.fn(() => true),
+      applyPatch: vi.fn(() => ({ ok: true })),
+      restore: vi.fn(() => ({ ok: true, restored: true })),
+    };
+    const sb = { set: vi.fn(), dispose() {} };
+    // Benign backend stub: {} reads as no-ad / not-killed / no-consent, and
+    // the captured URLs pin the ccVersion wire label below.
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: unknown) => {
+      calls.push(typeof input === "string" ? input : String(input));
+      return { ok: true, status: 200, json: async () => ({}) } as Response;
+    }));
+    commands._handlers.clear();
+    __wireForTest({ adapter, codexAdapter, statusBar: sb });
+    const ctx = makeContext();
+    try {
+      await expect(activate(ctx as never)).resolves.toBeUndefined();
+      // Proceeds: the sign-in surface exists and the bar is never relabeled.
+      expect(commands._handlers.has("kickbacks.signIn")).toBe(true);
+      expect(sb.set).not.toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "incompatible" }));
+      // bootCanary's widened auto-enable persisted K_ON through the
+      // codex-folded DebugController.apply()…
+      expect(ctx.globalState.get("kickbacks.debug.on")).toBe(true);
+      // …which patched Codex.
+      expect(codexAdapter.applyPatch).toHaveBeenCalled();
+      // The host-version label travels the wire as codex/<ver> (killswitch
+      // poll + demo-portfolio fetch), never as a bare CC-shaped version.
+      expect(calls.some((u) => u.includes("codex%2F26.513.21555"))).toBe(true);
+    } finally {
+      await deactivate();
+      vi.unstubAllGlobals();
+      restoreHome();
+    }
+  });
+
+  it("both targets incompatible -> early-return: incompatible label, no"
+    + " sign-in, CLI strand restore still runs", async () => {
+    const restoreHome = tempHome();
+    const adapter = {
+      name: "claude-code",
+      preflight: () => ({ ok: true, compatible: false, version: "9.9.9", reason: "x" }),
+      version: () => "9.9.9",
+      applyPatch: vi.fn(() => ({ ok: true })),
+      restore: vi.fn(() => ({ ok: true, restored: false })),
+    };
+    const codexAdapter = {
+      name: "codex",
+      preflight: () => ({ ok: true, compatible: false, version: null,
+        reason: "thinking-shimmer anchors not found" }),
+      version: () => null,
+      applyPatch: vi.fn(() => ({ ok: true })),
+      restore: vi.fn(() => ({ ok: true, restored: false })),
+    };
+    const sb = { set: vi.fn(), dispose() {} };
+    commands._handlers.clear();
+    cliRestore.mockClear();
+    __wireForTest({ adapter, codexAdapter, statusBar: sb });
+    try {
+      await expect(activate(makeContext() as never)).resolves.toBeUndefined();
+      expect(sb.set).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "incompatible" }));
+      expect(commands._handlers.has("kickbacks.signIn")).toBe(false);
+      expect(codexAdapter.applyPatch).not.toHaveBeenCalled();
+      // Audit #22's CLI strand restore is preserved on the narrower gate.
+      expect(cliRestore).toHaveBeenCalled();
+    } finally {
+      await deactivate();
+      restoreHome();
+    }
   });
 
   it("S9: a throwing Codex adapter never blocks CC or activation", async () => {

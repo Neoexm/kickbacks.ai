@@ -89,6 +89,31 @@ export class AuthClient {
    *  clientId is intentionally KEPT (device id, not auth). Never throws. */
   async signOut(): Promise<void> {
     this.at = null;
+    // Revoke server-side FIRST (BL-188): resolve the raw refresh token before
+    // the clears below destroy every copy, then fire the revocation without
+    // awaiting it — sign-out must stay instant and must succeed offline. The
+    // backend deletes the token record, so a copy of the rotating token
+    // (stolen file, forgotten machine) can no longer mint sessions for the
+    // rest of its TTL after the user signed out.
+    try {
+      let rt = (await this.ctx.secrets.get(R)) || undefined;
+      if (!rt) {
+        const stored = this.readFallback().refresh;
+        if (stored && ENVELOPE.test(stored)) {
+          rt = (await this.vault.open(stored)) || undefined;
+        } else if (stored) {
+          rt = stored;
+        }
+      }
+      if (rt) {
+        this.f(`${this.base}/v1/auth/signout`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ refresh_token: rt }),
+        }).then((r) => dlog("ext", "auth.revoke", { ok: r.ok, status: r.status }))
+          .catch((e) => dlog("ext", "auth.revoke",
+            { ok: false, msg: e instanceof Error ? e.message : String(e) }));
+      }
+    } catch { /* revocation is defense-in-depth; never block sign-out */ }
     const env = this.readFallback().refresh;
     try { await this.ctx.secrets.delete(A); } catch { /* best-effort */ }
     try { await this.ctx.secrets.delete(R); } catch { /* best-effort */ }

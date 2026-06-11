@@ -17,6 +17,7 @@ vi.mock("../src/log", () => ({
   dlogRaw: () => {},
   debugIconDataUri: () => "",
   codexEnabled: () => false,
+  codexDisabled: () => false,
   codexCliEnabled: () => false,
   testHooksEnabled: () => true,
   LOG_PATH: "/tmp/test-log",

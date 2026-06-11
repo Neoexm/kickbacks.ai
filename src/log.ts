@@ -60,13 +60,20 @@ export function debugEnabled(): boolean {
   } catch { return false; }
 }
 
-// S9 Codex dual-target opt-in. PRODUCTION DEFAULT IS OFF (prime directive:
-// it crashed Claude Code once and is not yet manually smoke-verified). This
-// only enables Codex auto-discovery for an explicit opt-in: `VIBE_ADS_CODEX=1`
+// S9 Codex dual-target opt-in. PRODUCTION DEFAULT IS OFF on machines running
+// a compatible Claude Code (prime directive: it crashed Claude Code once and
+// the dual-install path is not yet manually smoke-verified). This only
+// enables Codex auto-discovery for an explicit opt-in: `VIBE_ADS_CODEX=1`
 // OR a `~/.vibe-ads/codex.enabled` sentinel — the sentinel is the headless,
 // no-relaunch toggle for smoke-testing (create/remove from a shell, reload).
 // Never throws. Do NOT widen this to a default-on until smoke + a
 // can't-crash-CC verification both pass.
+//
+// NOTE: this is the raw opt-IN only. The CLAUDE-INCOMPATIBLE FALLBACK (Codex
+// discovery turns on by itself when no compatible Claude Code target exists —
+// there is nothing of ours to crash on such a machine) is composed in
+// extension.ts via activation/codexFallback.codexDiscoveryEnabled(), where
+// both preflights are visible. codexDisabled() below beats both.
 const CODEX_SENTINEL = join(DIR, "codex.enabled");
 export function codexEnabled(): boolean {
   try {
@@ -74,6 +81,20 @@ export function codexEnabled(): boolean {
     if (process.env.KICKBACKS_CODEX === "1"
         || process.env.VIBE_ADS_CODEX === "1") return true;
     return existsSync(CODEX_SENTINEL);
+  } catch { return false; }
+}
+
+// Explicit local opt-OUT for Codex targeting. Beats BOTH the opt-in above and
+// the claude-incompatible fallback (composed in extension.ts). KICKBACKS_CODEX=0
+// / VIBE_ADS_CODEX=0, or a ~/.vibe-ads/codex.disabled sentinel — the headless
+// one-liner support remediation (create from a shell, reload, done). Never
+// throws.
+const CODEX_DISABLED_SENTINEL = join(DIR, "codex.disabled");
+export function codexDisabled(): boolean {
+  try {
+    if (process.env.KICKBACKS_CODEX === "0"
+        || process.env.VIBE_ADS_CODEX === "0") return true;
+    return existsSync(CODEX_DISABLED_SENTINEL);
   } catch { return false; }
 }
 

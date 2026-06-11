@@ -245,13 +245,19 @@ export class Loopback {
             res.statusCode = r.status;
             res.setHeader("content-type", "application/json");
             res.end(JSON.stringify(r.body));
-          }).catch(() => {
+          }).catch((e) => {
+            dlog("ext", "loopback.test_route_error",
+              { name, msg: e instanceof Error ? e.message : String(e) });
             try { res.statusCode = 500; res.end(); } catch { /* ignore */ }
           });
           return;
         }
         res.statusCode = 404; res.end();
-      } catch { try { res.statusCode = 500; res.end(); } catch { /* ignore */ } }
+      } catch (e) {
+        dlog("ext", "loopback.handler_error",
+          { msg: e instanceof Error ? e.message : String(e) });
+        try { res.statusCode = 500; res.end(); } catch { /* ignore */ }
+      }
     });
     // Build the candidate port list: preferredPort (if any) + N-1
     // sequential fallbacks, then 0 (OS-assigned) as the final fallback.

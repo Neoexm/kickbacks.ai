@@ -324,6 +324,49 @@ describe("AuthClient", () => {
     expect(a2.clientId()).toBe(id1);
   });
 
+  // BL-188: sign-out must also revoke the rotating refresh token SERVER-side
+  // — pre-fix it stayed mintable for its full TTL after a client-local clear.
+  it("signOut posts the refresh token to /v1/auth/signout for revocation", async () => {
+    const file = mkAuthFile();
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const f = vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, init });
+      return url.includes("/extension/start")
+        ? { status: 307, headers: { get: (k: string) =>
+            k.toLowerCase() === "location" ? "https://g/auth?state=S1" : null } } as unknown as Response
+        : { ok: true, status: 200,
+            json: async () => ({ access_token: "AT", refresh_token: "RT" }) } as Response;
+    });
+    const a = new AuthClient("http://b", makeContext() as never, f as never, 0, file, pv());
+    await a.signIn();
+    await a.signOut();
+    const revoke = calls.find((c) => c.url.includes("/v1/auth/signout"));
+    expect(revoke).toBeTruthy();
+    expect(revoke!.init?.method).toBe("POST");
+    expect(String(revoke!.init?.body)).toContain("RT");   // the stored token
+    expect(a.signedIn()).toBe(false);                     // local clear intact
+  });
+
+  it("signOut still completes (and clears locally) when revocation fails", async () => {
+    const file = mkAuthFile();
+    const f = vi.fn(async (url: string) => {
+      if (url.includes("/extension/start")) {
+        return { status: 307, headers: { get: (k: string) =>
+          k.toLowerCase() === "location" ? "https://g/auth?state=S1" : null } } as unknown as Response;
+      }
+      if (url.includes("/v1/auth/signout")) {
+        throw new Error("offline");                       // revocation refused
+      }
+      return { ok: true, status: 200,
+        json: async () => ({ access_token: "AT", refresh_token: "RT" }) } as Response;
+    });
+    const a = new AuthClient("http://b", makeContext() as never, f as never, 0, file, pv());
+    await a.signIn();
+    await a.signOut();                                    // must not throw
+    expect(a.signedIn()).toBe(false);
+    expect(JSON.parse(readFileSync(file, "utf8")).refresh).toBeUndefined();
+  });
+
   it("clientId is a stable persisted anon id (survives a fresh ctx via file)", async () => {
     const file = mkAuthFile();
     const a1 = new AuthClient("http://b", makeContext() as never, (async () => ({})) as never, 0, file, pv());

@@ -84,4 +84,40 @@ describe("adRotation session-token refresh", () => {
     expect(activeAdRef.current.sessionToken).toBe("tok-A2");
     expect(applyPatch).toHaveBeenCalled(); // real ad change ⇒ overlay re-patched
   });
+
+  // BL-187: the demo stamp must travel WITH the adopted token. A mid-session
+  // demotion can return the SAME adId from the demo portfolio; adopting only
+  // the token left the object demo:false, so the status bar (whose signed-out
+  // gate is `!ad.demo` — it has no signedIn() probe) kept showing and billing
+  // ads while signed out.
+  it("adopts the demo stamp when a demotion swaps to demo ads with the same id", async () => {
+    const initial = resp([ad("a1", "tok-REAL")]);          // real: no demo flag
+    const fetchImpl = vi.fn(async () =>
+      resp([{ ...ad("a1", "demo-tok"), demo: true }]));    // demoted, same adId
+    const { deps, timers, activeAdRef, adRef, applyPatch } = makeDeps(initial, fetchImpl);
+    cleanups.push(() => timers.forEach((t) => clearInterval(t as unknown as NodeJS.Timeout)));
+
+    const handle = setupAdRotation(deps, initial);
+    applyPatch.mockClear();
+    await handle.refreshNow(false);
+
+    expect(activeAdRef.current.sessionToken).toBe("demo-tok");
+    expect(activeAdRef.current.demo).toBe(true);   // statusbar gate re-engages
+    expect(adRef.current?.demo).toBe(true);
+    expect(applyPatch).not.toHaveBeenCalled();     // still a churn-free adopt
+  });
+
+  it("clears the demo stamp when a re-auth swaps back to real ads", async () => {
+    const initial = resp([{ ...ad("a1", "demo-tok"), demo: true }]);
+    const fetchImpl = vi.fn(async () => resp([ad("a1", "tok-REAL")])); // real again
+    const { deps, timers, activeAdRef, adRef } = makeDeps(initial, fetchImpl);
+    cleanups.push(() => timers.forEach((t) => clearInterval(t as unknown as NodeJS.Timeout)));
+
+    const handle = setupAdRotation(deps, initial);
+    await handle.refreshNow(false);
+
+    expect(activeAdRef.current.sessionToken).toBe("tok-REAL");
+    expect(activeAdRef.current.demo).toBeFalsy();  // real ads aren't suppressed
+    expect(adRef.current?.demo).toBeFalsy();
+  });
 });

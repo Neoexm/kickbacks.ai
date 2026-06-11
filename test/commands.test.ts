@@ -19,8 +19,8 @@ import { join } from "node:path";
 // tests never read dev-machine sentinels. Same trick auth.test.ts uses.
 vi.mock("../src/log", () => ({ debugEnabled: () => false, dlog: () => {},
   dlogRaw: () => {}, debugIconDataUri: () => "",
-  codexEnabled: () => false, codexCliEnabled: () => false,
-  testHooksEnabled: () => false,
+  codexEnabled: () => false, codexDisabled: () => false,
+  codexCliEnabled: () => false, testHooksEnabled: () => false,
   LOG_PATH: "/tmp/test-log" }));
 
 import { activate, deactivate, __wireForTest } from "../src/extension";
@@ -150,6 +150,19 @@ describe("contributed commands → registered handlers", () => {
       for (const id of CONTRIBUTED) {
         expect(commands._handlers.has(id), `missing handler: ${id}`).toBe(true);
       }
+    } finally { await t.dispose(); }
+  });
+
+  it("ccVersion wire label: the CLAUDE version wins when claude is"
+    + " compatible (codex present or not)", async () => {
+    // Pins the codex-only counterpart in extension.test.ts: a compatible
+    // Claude Code must keep reporting its own version on the killswitch /
+    // portfolio wire — never the codex/<ver> label.
+    const t = await boot({ codex: true });
+    try {
+      expect(t.fetched.calls.some((u) => u.includes("version=2.1.143")),
+        "killswitch poll must carry the claude version").toBe(true);
+      expect(t.fetched.calls.some((u) => u.includes("codex%2F"))).toBe(false);
     } finally { await t.dispose(); }
   });
 

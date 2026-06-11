@@ -39,7 +39,8 @@ afterAll(() => {
 // Mute dlog (same pattern as extension.test.ts) so test-driven activate()
 // calls don't append to the developer's real ~/.vibe-ads/debug.log.
 vi.mock("../src/log", () => ({ debugEnabled: () => false, dlog: () => {},
-  dlogRaw: () => {}, codexEnabled: () => false, codexCliEnabled: () => false,
+  dlogRaw: () => {}, codexEnabled: () => false, codexDisabled: () => false,
+  codexCliEnabled: () => false,
   testHooksEnabled: () => false, debugIconDataUri: () => "",
   LOG_PATH: "/tmp/test-log" }));
 

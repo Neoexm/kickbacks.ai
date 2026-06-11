@@ -11,7 +11,8 @@ vi.mock("node:os", async (importOriginal) => {
   return { ...os, homedir: () => h.home };
 });
 
-import { locateClaudeCodeLog, transcriptEntrypoint } from "../src/locate";
+import { locateClaudeCodeLog, locateClaudeCliLog,
+         transcriptEntrypoint } from "../src/locate";
 
 function freshHome(): string {
   h.home = mkdtempSync(join(tmpdir(), "vibe-ads-locate-"));
@@ -36,6 +37,7 @@ function backdate(f: string, ms: number): void {
 beforeEach(() => {
   delete process.env.KICKBACKS_CC_LOG;
   delete process.env.VIBE_ADS_CC_LOG;
+  delete process.env.KICKBACKS_CLI_LOG;
   freshHome();
 });
 
@@ -102,5 +104,49 @@ describe("locateClaudeCodeLog entrypoint filter", () => {
 
   it('returns "" when no transcripts exist at all', () => {
     expect(locateClaudeCodeLog()).toBe("");
+  });
+});
+
+// The terminal-side mirror (the Steven fix): the statusbar/statusline billing
+// signal for TUI-only users, where locateClaudeCodeLog correctly returns "".
+describe("locateClaudeCliLog", () => {
+  it("returns the newest cli-tagged transcript", () => {
+    const d = projDir(h.home);
+    const older = join(d, "older.jsonl");
+    const newer = join(d, "newer.jsonl");
+    writeFileSync(older, rec("cli"), "utf8");
+    writeFileSync(newer, rec("cli"), "utf8");
+    backdate(older, 60_000);
+    expect(locateClaudeCliLog()).toBe(newer);
+  });
+
+  it("skips claude-vscode transcripts even when they are newer", () => {
+    const d = projDir(h.home);
+    const vscode = join(d, "vscode.jsonl");
+    const cli = join(d, "cli.jsonl");
+    writeFileSync(cli, rec("cli"), "utf8");
+    writeFileSync(vscode, rec("claude-vscode"), "utf8");
+    backdate(cli, 60_000);                     // panel session moved last
+    expect(locateClaudeCliLog()).toBe(cli);
+  });
+
+  it("does NOT claim untagged transcripts (they stay with the strict resolver)", () => {
+    const d = projDir(h.home);
+    writeFileSync(join(d, "untagged.jsonl"), rec(undefined), "utf8");
+    expect(locateClaudeCliLog()).toBe("");
+  });
+
+  it('returns "" when only panel transcripts exist', () => {
+    const d = projDir(h.home);
+    writeFileSync(join(d, "a.jsonl"), rec("claude-vscode"), "utf8");
+    expect(locateClaudeCliLog()).toBe("");
+  });
+
+  it("honours the KICKBACKS_CLI_LOG override", () => {
+    const d = projDir(h.home);
+    const f = join(d, "explicit.jsonl");
+    writeFileSync(f, rec("cli"), "utf8");
+    process.env.KICKBACKS_CLI_LOG = f;
+    expect(locateClaudeCliLog()).toBe(f);
   });
 });

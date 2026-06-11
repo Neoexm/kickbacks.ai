@@ -31,7 +31,9 @@ const CLICK_THRESHOLD_MS = 15_000;
  *  loopback port race (EADDRINUSE on reload/self-update) or a single applyPatch
  *  failure. A live, already-patched block is STILL serving the ad, so it must
  *  not be relabeled "incompatible": return `null` to defer to the active /
- *  earnings state. Only a genuinely un-patched target yields an incompatible
+ *  earnings state. `isPatched` is "ANY webview target is patched" — a serving
+ *  Codex block counts exactly like a serving Claude Code block (S9 dual
+ *  target). Only a genuinely un-patched install yields an incompatible
  *  status. Pure + exported so the honest-label contract is unit-tested without
  *  standing up the loopback. */
 export function applyMissStatus(
@@ -63,6 +65,12 @@ export interface WebviewInjectionDeps {
   statusBarShowActive: () => Promise<void>;
   scheduleEarningsRefresh: () => void;
   desyncState: DesyncState;
+  /** Whether the Claude Code target preflighted compatible at activation.
+   *  False on a codex-only boot: the Claude applyPatch/reassert writers are
+   *  skipped (they'd fail anchor validation every tick anyway) and Codex is
+   *  the serving surface. Omitted ⇒ true (legacy callers/tests keep the
+   *  Claude-primary semantics). */
+  claudeCompatible?: boolean;
   /** Forwarded to ad rotation: fired after each ad apply so the CLI surface can
    *  re-sync immediately (sign-in swap / rotation) instead of waiting 60s. */
   onAdApplied?: () => void;
@@ -245,11 +253,21 @@ export async function setupWebviewInjection(
     viewThresholdMs,
   };
 
+  const claudeCompatible = deps.claudeCompatible ?? true;
+
   // Honest status: a transient miss THIS cycle (a loopback port race on
   // reload/self-update, or a single applyPatch failure) must NOT clobber a
-  // still-live, ad-serving block to a scary "incompatible" label.
+  // still-live, ad-serving block to a scary "incompatible" label. EITHER
+  // target counts — a serving Codex block keeps the label honest exactly
+  // like a serving Claude Code block.
+  const anyTargetPatched = (): boolean => {
+    try { if (adapter.isPatched?.() === true) return true; }
+    catch { /* fall through to codex */ }
+    try { return codexAdapter?.isPatched?.() === true; }
+    catch { return false; }
+  };
   const setIncompatibleUnlessPatched = (): void => {
-    const s = applyMissStatus(adapter.isPatched?.() === true, ccVersion);
+    const s = applyMissStatus(anyTargetPatched(), ccVersion);
     if (s) statusBar.set(s);
     else void statusBarShowActive();
   };
@@ -269,7 +287,13 @@ export async function setupWebviewInjection(
   // persisted kill must also stop THIS production-path write — pre-fix only
   // the bootCanary's own debug-path calls were skipped, and the activation
   // path re-patched seconds after the "skipping automatic patch" toast.
-  if (canPatch()) {
+  // A codex-only boot (claude incompatible) skips the doomed Claude write
+  // entirely: it would fail anchor validation and clobber the status bar.
+  if (!canPatch()) {
+    dlog("ext", "applyPatch.skip", { gate: servingVerdict() });
+  } else if (!claudeCompatible) {
+    dlog("ext", "applyPatch.skip", { reason: "claude-incompatible" });
+  } else {
     const res = adapter.applyPatch(patchParams);
     dlog("ext", "applyPatch", { ok: res.ok, reason: res.reason });
     if (res.ok) {
@@ -277,11 +301,14 @@ export async function setupWebviewInjection(
       void statusBarShowActive();
     }
     else setIncompatibleUnlessPatched();
-  } else {
-    dlog("ext", "applyPatch.skip", { gate: servingVerdict() });
   }
 
-  // S9: patch Codex with the SAME ad/loopback params.
+  // S9: patch Codex with the SAME ad/loopback params. A Codex success drives
+  // the "active" status bar (it IS the serving surface on a codex-only boot)
+  // but must NEVER set desyncState.lastApplyAt — that would arm the CLAUDE
+  // webview-cache desync watchdog (cycle → reload → toast ladder) with no
+  // Claude apply to heal; lastApplyAt === 0 keeps it deliberately passive
+  // (reassert.ts::desyncDecision "no-apply").
   const applyCodex = (): void => {
     if (!codexAdapter) return;
     if (!canPatch()) { dlog("ext", "codex.skip", { reason: "serving-gate" }); return; }
@@ -294,21 +321,30 @@ export async function setupWebviewInjection(
       }
       const cr = codexAdapter.applyPatch(patchParams);
       dlog("ext", "codex.applyPatch", { ok: cr.ok, reason: cr.reason });
+      if (cr.ok) void statusBarShowActive();
     } catch (e) {
       dlog("ext", "codex.error", { msg: errMsg(e) });
     }
   };
   const reapplyCodex = applyCodex;
+  // Codex-only boot: apply NOW — the deferred call below would leave the
+  // first 10s of the session unserved (and the status bar unconfirmed).
+  // Idempotent: the 10s pass re-validates via isPatched/marker checks.
+  if (!claudeCompatible) applyCodex();
   actx.timers.push(setTimeout(applyCodex, 10_000));
 
-  // Reassert the injection on a timer.
+  // Reassert the injection on a timer. The Claude branch is gated on the
+  // boot-time compatibility flag: a codex-only boot would otherwise retry a
+  // doomed anchor-validation failure every 60s (a mid-session CC install
+  // lands in a NEW versioned directory this adapter's fixed target can't
+  // see — only a reload re-preflights, same as today).
   const reassertWebview = (): void => {
     try {
       // canPatch() folds in the serving gate (kill posture incl. the offline
       // freeze, master toggle, canary suspension) — wave 2, audit #4/#9.
       if (!canPatch() || !shouldReassert({
           haveAd: !!adRef.current, killed: killedRef.current })) return;
-      if (adapter.isPatched?.() !== true) {
+      if (claudeCompatible && adapter.isPatched?.() !== true) {
         const r = adapter.applyPatch(patchParams);
         if (!r.ok) dlog("ext", "reassert.skip", { reason: r.reason });
       }
@@ -330,11 +366,13 @@ export async function setupWebviewInjection(
       // fire on a killed / frozen / disabled / suspended install (wave 2).
       if (!canPatch() || !shouldReassert({
           haveAd: !!adRef.current, killed: killedRef.current })) return;
-      adapter.restore();
-      const r = adapter.applyPatch(patchParams);
-      if (r.ok) desyncState.lastApplyAt = Date.now();
+      if (claudeCompatible) {
+        adapter.restore();
+        const r = adapter.applyPatch(patchParams);
+        if (r.ok) desyncState.lastApplyAt = Date.now();
+        dlog("ext", "reassert.cycle", { ok: r.ok, reason: r.reason });
+      }
       applyCodex();
-      dlog("ext", "reassert.cycle", { ok: r.ok, reason: r.reason });
     } catch { /* prime directive: never break activation */ }
   };
 

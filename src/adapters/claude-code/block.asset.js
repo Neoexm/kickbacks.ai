@@ -923,9 +923,14 @@
     // TEXT NODE inside the anchor (nodeValue write) and the anchor's href
     // attribute. NEVER innerHTML and never re-create the anchor — rewriting
     // a live clickable element detaches it mid-click (a shipped bug, fixed
-    // once). The icon swap is deliberately deferred to the next thaw's
-    // structural rebuild (pollAd cleared _chromeSig, so the first active
-    // paint() rebuilds with the new FAVICON). Billing: pollAd already wiped
+    // once). The icon is retargeted in place too (a src swap on the EXISTING
+    // img — the img is a SIBLING of the anchor, so the anchor is untouched):
+    // the swap used to be deferred to the next thaw's rebuild, which left the
+    // NEW ad's text docked beside the OLD ad's logo for the whole idle
+    // period. When the icon node shape doesn't match the new creative (img
+    // vs inline 'K' SVG) there is no anchor-safe in-place swap — fall through
+    // to the drop path; a missing overlay beats a crossed icon/ad pair.
+    // Billing: pollAd already wiped
     // _vt (the old ad's session is ENDED); the docked state stays
     // NON-billing per persist-at-idle, so NO live session is started here —
     // the next thaw's viewShow(AD) opens the NEW ad's session, and the
@@ -943,8 +948,21 @@
           lastNode = null;
           return;
         }
+        // Icon shape check BEFORE any mutation so a drop never leaves a
+        // half-retargeted overlay. Tier <3 renders no icon at all — skip.
+        var icon = (TIER >= 3)
+          ? overlay.querySelector('img[data-va-icon="1"]') : null;
+        if (TIER >= 3 && (ICON_URL ? !icon : !!icon)) {
+          // New creative needs an img but the docked one has the 'K' SVG
+          // (or vice versa): no anchor-safe in-place swap exists.
+          dlog("ad.dock_retarget_drop", { why: "icon_shape" });
+          dropOverlay();
+          lastNode = null;
+          return;
+        }
         tn.nodeValue = AD;          // text node only — anchor never detached
         a.setAttribute("href", CLICKURL ? CLICKURL : "#");
+        if (icon && ICON_URL) icon.setAttribute("src", ICON_URL);
         dlog("ad.dock_retarget", { toId: AD_ID });
       } catch (e) {
         // Never show a stale creative: drop on any error (prime directive —
@@ -996,7 +1014,11 @@
       placeOverlay(row);
       var dots = ellipsis(st.frame);
       var elapsed = fmtElapsed(now - st.simStart);
-      var sig = TIER + "|" + AD + "|" + CLICKURL;
+      // AD_ID and ICON_URL are in the signature so a rotation between two
+      // creatives with identical text+clickUrl, or a same-ad icon update,
+      // still triggers the structural rebuild (the icon img is only written
+      // on this path).
+      var sig = TIER + "|" + AD_ID + "|" + AD + "|" + CLICKURL + "|" + ICON_URL;
       if (sig !== _chromeSig) {
         o.innerHTML = buildAdHtml(TIER, { ad: AD,
           href: CLICKURL, elapsed: elapsed, dots: dots });
@@ -1066,7 +1088,13 @@
               _bannerLast = "";
               dlog("ad.serve_resume", { adId: j.adId });
             }
-            var changed = (j.adId && j.adId !== AD_ID) || (j.adText !== AD) || (j.clickUrl !== CLICKURL);
+            // Icon is part of the change check: a same-ad icon update (an
+            // advertiser swaps their creative icon, or the backend's first
+            // serve carried the raw https URL and a later one the inlined
+            // data: URI) must be adopted too, or the stale icon sits next to
+            // this ad for the life of the webview.
+            var changed = (j.adId && j.adId !== AD_ID) || (j.adText !== AD)
+              || (j.clickUrl !== CLICKURL) || ((j.iconUrl || "") !== ICON_URL);
             if (!changed) return;
             dlog("ad.rotated", { fromId: AD_ID, toId: j.adId, from: AD, to: j.adText });
             AD_ID = j.adId || AD_ID;

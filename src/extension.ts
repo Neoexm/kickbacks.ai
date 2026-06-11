@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { homedir, release } from "node:os";
 import { join } from "node:path";
 import { existsSync, unlinkSync } from "node:fs";
-import { locateClaudeCode, locateClaudeCodeLog } from "./locate";
+import { locateClaudeCode, locateClaudeCodeLog, locateClaudeCliLog } from "./locate";
 import { ClaudeCodeAdapter } from "./adapters/claude-code/adapter";
 import { CodexAdapter } from "./adapters/codex/adapter";
 import { ClaudeCliStatuslineAdapter } from "./adapters/claude-cli/adapter";
@@ -26,20 +26,21 @@ import { notifyIncompatible } from "./activation/incompatNotice";
 import { registerDiagnoseCommand } from "./activation/diagnose";
 import { setupDesyncDetector, type DesyncState } from "./activation/desyncDetector";
 import { shouldReassert } from "./reassert";
-import { setupStatusBarAd } from "./activation/statusBarAd";
 import { registerCommands, restoreCodexSafe } from "./activation/commands";
 import { setupEarningsRefresh } from "./activation/earningsRefresh";
 import { setupWebviewInjection, type WebviewInjectionResult }
   from "./activation/webviewInjection";
 import { setupCliSync } from "./activation/cliSync";
+import { setupCliTick } from "./activation/cliTick";
 import { createActivationContext, type ActivationContext } from "./activation/context";
 import { resetServingGate, wireServingGateEnabled, setKillPosture,
   killPosture, canPatch, servingSuspended, servingVerdict }
   from "./servingGate";
 import { TestHooks } from "./testHooks";
 import { buildLabel, buildVersion } from "./buildinfo";
-import { dlog, debugEnabled, codexEnabled, codexCliEnabled,
+import { dlog, debugEnabled, codexEnabled, codexDisabled, codexCliEnabled,
          testHooksEnabled } from "./log";
+import { codexDiscoveryEnabled } from "./activation/codexFallback";
 import { webviewMode } from "./modes";
 import { SessionState } from "./sessionState";
 import { watchFile as nodeWatchFile, readFileSync, statSync } from "node:fs";
@@ -117,10 +118,24 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       new ClaudeCodeAdapter(target || "/__vibe_ads_no_target__");
     actx.ccAdapter = adapter;
 
-    // S9: resolve the optional Codex target.
+    // Claude preflight, hoisted above Codex resolution: the codex-fallback
+    // policy below needs to know whether a compatible Claude Code exists on
+    // this machine. Read-only; bootCanary re-runs its own copy later.
+    const pf = adapter.preflight();
+
+    // S9: resolve the optional Codex target. Discovery = the explicit opt-in
+    // (codexEnabled) OR the claude-incompatible FALLBACK: with no compatible
+    // Claude Code here there is nothing of ours to crash (the S9 guard
+    // protects dual-install machines, which stay opt-in-only), and without
+    // the fallback a Codex-only install is dead weight — red "incompatible"
+    // bar, no sign-in, no serving. Explicit opt-out (codexDisabled) beats
+    // both. See activation/codexFallback.ts.
+    const codexDiscovery = codexDiscoveryEnabled({
+      optIn: codexEnabled(), optOut: codexDisabled(),
+      claudeCompatible: pf.compatible });
     actx.codexAdapter = override
       ? (override.codexAdapter ?? null)
-      : (codexEnabled()
+      : (codexDiscovery
           ? (() => {
               try {
                 const ct = locateCodexTarget();
@@ -129,7 +144,19 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
             })()
           : null);
     const codexAdapter = actx.codexAdapter;
+    // Single guarded Codex preflight, shared by the activation gate, the
+    // bootCanary auto-enable widening, and the ccVersion label below.
+    const codexPf = (() => {
+      try { return codexAdapter?.preflight() ?? null; } catch { return null; }
+    })();
+    const claudeOk = pf.compatible;
+    const codexOk = codexPf?.compatible === true;
     const statusBar = override?.statusBar ?? new StatusBar();
+    // Owned by the extension context: disposing with it is the only teardown
+    // path that reaches the bar item — deactivate() works off actx and never
+    // sees this object, so without this push a disable-without-reload strands
+    // the item in the status bar.
+    ctx.subscriptions.push(statusBar);
 
     const session = new SessionState();
 
@@ -270,13 +297,16 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     dlog("ext", "activate", { target: !!target, build: buildLabel(),
       debug: debugEnabled() });
 
-    // Boot canary.
-    const { firstRun } = await setupBootCanary(adapter, debugCtl, ctx);
+    // Boot canary. `anyTargetCompatible` widens the clean-boot auto-enable
+    // to Codex-only machines (their K_ON would otherwise never persist).
+    const { firstRun } = await setupBootCanary(adapter, debugCtl, ctx,
+      claudeOk || codexOk);
 
-    const pf = adapter.preflight();
     dlog("ext", "preflight",
-      { compatible: pf.compatible, version: pf.version, reason: pf.reason });
-    if (!pf.compatible) {
+      { compatible: pf.compatible, version: pf.version, reason: pf.reason,
+        codexCompatible: codexOk, codexVersion: codexPf?.version ?? null,
+        codexFallback: codexDiscovery && !codexEnabled() });
+    if (!claudeOk && !codexOk) {
       statusBar.set({ kind: "incompatible", version: pf.version ?? "unknown" });
       notifyIncompatible(ctx, adapter, pf);
       // Audit #22: this early return used to strand a previously-patched
@@ -291,6 +321,20 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
           join(homedir(), ".claude", "settings.json"));
         const r = actx.cliStatus.restore();
         dlog("ext", "cli.strandRestore", { restored: r.restored });
+      } catch { /* best-effort; never disturb the early return */ }
+      // Codex strand restore (symmetric with audit #22): a previously-served
+      // Codex shimmer patch + K_ON=true gets stranded when this machine later
+      // turns both-incompatible (e.g. ~/.vibe-ads/codex.disabled set after a
+      // codex-only serving run) — deactivate() skips restore while
+      // userWantsPatched, and this early return skips all serving teardown.
+      // Construct fresh from the locator (codexAdapter is null when discovery
+      // is off); restore() is a no-op without a backup marker.
+      try {
+        const ct = locateCodexTarget();
+        if (ct) {
+          const r = new CodexAdapter(ct).restore();
+          dlog("ext", "codex.strandRestore", { restored: r.restored });
+        }
       } catch { /* best-effort; never disturb the early return */ }
       return;
     }
@@ -328,6 +372,11 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       ctx, UPDATE_BASE, buildVersion(), localVsixPath, lastLocalVsixMtime,
       watchFileImpl(), actx.timers, CFG.updatePollIntervalMs);
     const logTail = new LogTail(locateClaudeCodeLog);
+    // Terminal-side activity signal (newest entrypoint:"cli" transcript):
+    // feeds the statusbar ad's CLI path and the statusline view-tick loop.
+    // A separate LogTail so the overlay/desync watchdog keeps its strict
+    // panel-only signal (audit #24).
+    const cliTail = new LogTail(locateClaudeCliLog);
     const earningsClient = new EarningsClient(BASE,
       () => auth.accessToken(), fetch, async () => auth.refresh());
     const consentClient = new ConsentClient(BASE, () => auth.accessToken());
@@ -335,17 +384,25 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       client: consentClient, ctx, vsc: vscode,
       dlog: (msg) => dlog("ext", "consent", { msg }),
     });
-    const ccVersion = pf.version ?? "unknown";
+    // Host-version label. Claude-compatible machines report the CC version
+    // exactly as before. Codex-only machines report a PREFIXED label
+    // ("codex/<ver>") — self-describing in fleet/metrics analytics, and
+    // independently kill-targetable (the killswitch version scope is an
+    // exact opaque-string match server-side), never colliding with a CC
+    // semver key.
+    const ccVersion = claudeOk
+      ? (pf.version ?? "unknown")
+      : `codex/${codexPf?.version ?? "unknown"}`;
     session.set({ ccVersion });
 
     // ─── Earnings ───────────────────────────────────────────────────
-    // Shared arbiter: statusBarAd sets adBar.adShowing while its ad owns the
-    // status-bar item; the earnings refresh consults it so it won't clobber a
-    // live ad. Declared here so both subsystems share the one reference.
-    const adBar = { adShowing: false };
+    // The status-bar item is the BALANCE surface, full stop (product
+    // decision 2026-06-10): it always shows the earnings/identity states
+    // painted by showActive, never ad creative. Ads live on the spinner
+    // verb, the in-window overlay, and the TUI statusline (cliTick bills
+    // that one) — so no isAdShowing arbiter is wired here anymore.
     const { showActive, scheduleEarningsRefresh } = setupEarningsRefresh(
-      auth, earningsClient, session, statusBar, ccVersion, ctx,
-      () => adBar.adShowing);
+      auth, earningsClient, session, statusBar, ccVersion, ctx);
 
     // ─── Portfolio ──────────────────────────────────────────────────
     // Signed in → the real, user-crediting portfolio. Signed out (incl. a
@@ -509,6 +566,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
         statusBarShowActive: showActive,
         scheduleEarningsRefresh,
         desyncState,
+        claudeCompatible: claudeOk,
         onAdApplied: () => cliResync.run(),
       });
       lbInfo = wvResult.lbInfo;
@@ -531,7 +589,12 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     // still win (prime directive: a killed / opted-out / crash-suspect
     // install must never have CC files touched).
     if (!killed && !servingSuspended() && webviewMode() === "on") {
-      try { adapter.prime?.(); } catch { /* prime directive */ }
+      // Claude prime only when the target is genuinely patchable: CSP-priming
+      // a present-but-incompatible CC would touch its files for a webview we
+      // will never inject (codex-only proceed path).
+      if (claudeOk) {
+        try { adapter.prime?.(); } catch { /* prime directive */ }
+      }
       try { codexAdapter?.prime?.(); } catch { /* prime directive */ }
     }
 
@@ -548,17 +611,29 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     // subsequent applyAd re-syncs the CLI surface immediately.
     cliResync.run = cliSync.syncNow;
 
-    // ─── Status bar ad ──────────────────────────────────────────────
-    setupStatusBarAd({
-      logTail,
+    // ─── Status bar ─────────────────────────────────────────────────
+    // No setupStatusBarAd here (removed 2026-06-10): the VS Code status
+    // bar shows the balance at all times and never serves ads. The module
+    // stays in src/activation/ unimported (and unit-tested) should the
+    // surface ever come back; billing for TUI users runs through the
+    // statusline cliTick below, panel users through the overlay.
+
+    // ─── Statusline view ticks (TUI billing) ────────────────────────
+    // The dwell loop for the terminal statusline surface — without it a
+    // TUI-only user sees ads all day and never earns (cliSync emits
+    // impressions only). Gated on a live terminal turn via cliTail.
+    setupCliTick({
+      cliTail,
       metrics,
-      statusBar,
       adRef,
       killedRef,
+      signedIn: () => !!auth.accessToken(),
+      surfaceApplied: () => {
+        try { return actx.cliStatus?.preflight().compatible ?? false; }
+        catch { return false; }
+      },
       ccVersion,
-      showActive,
       timers: actx.timers,
-      barState: adBar,
     });
 
     // ─── Periodic timers ────────────────────────────────────────────

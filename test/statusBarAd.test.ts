@@ -345,6 +345,116 @@ describe("setupStatusBarAd", () => {
     expect(renderedAfter).toBe(renderedBefore); // no new show while locked
   });
 
+  // The Steven fix: a TUI-only user has NO panel transcript (logTail null,
+  // by design since audit #24) — terminal activity via cliTail must engage
+  // the bar, but ONLY while this VS Code window is focused.
+  it("shows + bills on terminal (cliTail) activity when the window is focused", () => {
+    const d = makeDeps({
+      cliTail: { current: vi.fn().mockReturnValue(thinking()),
+        activityAgeMs: vi.fn().mockReturnValue(500) },
+      windowFocused: () => true,
+    } as any);
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(6000);
+    expect(d.statusBar.set).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "ad", adText: "Try Acme Widgets" }));
+    const ticks = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "view_tick");
+    expect(ticks.length).toBeGreaterThanOrEqual(1);
+    expect(ticks[0][1]).toMatchObject({ surface: "statusbar" });
+  });
+
+  it("ignores terminal activity when the window is NOT focused", () => {
+    const d = makeDeps({
+      cliTail: { current: vi.fn().mockReturnValue(thinking()),
+        activityAgeMs: vi.fn().mockReturnValue(500) },
+      windowFocused: () => false,
+    } as any);
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(6000);
+    expect(d.statusBar.set).not.toHaveBeenCalled();
+    expect(d.metrics.send).not.toHaveBeenCalled();
+  });
+
+  it("ignores terminal activity when no cliTail is wired (old call sites)", () => {
+    const d = makeDeps({ windowFocused: () => true } as any);
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(3000);
+    expect(d.statusBar.set).not.toHaveBeenCalled();
+  });
+
+  it("ends a cli-driven show when the terminal turn completes", () => {
+    const cliCurrent = vi.fn().mockReturnValue(thinking());
+    const d = makeDeps({
+      cliTail: { current: cliCurrent,
+        activityAgeMs: vi.fn().mockReturnValue(500) },
+      windowFocused: () => true,
+    } as any);
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(2000);
+    cliCurrent.mockReturnValue(idle());
+    vi.advanceTimersByTime(1000);
+    const viewable = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "impression_viewable");
+    expect(viewable).toHaveLength(1);
+    expect(d.barState.adShowing).toBe(false);
+  });
+
+  // The show time-box (2026-06-10 "the ad never disappears" report): agentic
+  // sessions keep `thinking` true for hours, so without a cap the earnings
+  // display never surfaced. A continuous show must end at AD_SHOW_MAX_MS,
+  // paint the balance immediately, rest AD_REST_MS, then may re-show.
+  it("time-boxes a continuous show: ends at the cap and paints earnings", () => {
+    const d = makeDeps();
+    d.logTail.current.mockReturnValue(thinking());
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(61_000);          // past AD_SHOW_MAX_MS
+    const viewable = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "impression_viewable");
+    expect(viewable).toHaveLength(1);        // show ended despite thinking
+    expect(d.showActive).toHaveBeenCalled(); // balance painted immediately
+    expect(d.barState.adShowing).toBe(false);
+  });
+
+  it("stops view_tick during the rest window even while still thinking", () => {
+    const d = makeDeps();
+    d.logTail.current.mockReturnValue(thinking());
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(61_000);          // cap hit, rest begins
+    const ticksAtCap = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "view_tick").length;
+    vi.advanceTimersByTime(15_000);          // inside the 20s rest
+    const ticksInRest = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "view_tick").length;
+    expect(ticksInRest).toBe(ticksAtCap);
+  });
+
+  it("re-shows the ad after the rest window when still thinking", () => {
+    const d = makeDeps();
+    d.logTail.current.mockReturnValue(thinking());
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(61_000);          // cap → rest
+    d.metrics.send.mockClear();
+    vi.advanceTimersByTime(25_000);          // rest (20s) elapsed
+    expect(d.metrics.send).toHaveBeenCalledWith("impression_rendered",
+      expect.objectContaining({ surface: "statusbar" }));
+    expect(d.barState.adShowing).toBe(true);
+  });
+
+  it("a show shorter than the cap keeps the existing idle-revert behavior", () => {
+    const d = makeDeps();
+    d.logTail.current.mockReturnValue(thinking());
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(10_000);          // well under the cap
+    d.logTail.current.mockReturnValue(idle());
+    vi.advanceTimersByTime(1000);
+    expect(d.metrics.send).toHaveBeenCalledWith("impression_viewable",
+      expect.objectContaining({ surface: "statusbar" }));
+    expect(d.showActive).not.toHaveBeenCalled();  // 6s hold first
+    vi.advanceTimersByTime(6000);
+    expect(d.showActive).toHaveBeenCalledTimes(1);
+  });
+
   it("suspend clamp: a sleep gap mid-show is not billed as visible time", () => {
     // Pre-fix visibleMs was a raw wall-clock span (now - showStart): an 8h
     // laptop suspend mid-show inflated the next view_tick and the final
@@ -365,5 +475,40 @@ describe("setupStatusBarAd", () => {
     const visibleMs = (viewable![1] as { visibleMs: number }).visibleMs;
     expect(visibleMs).toBeLessThan(20_000);  // ~7s real, never 8h
     expect(visibleMs).toBeGreaterThanOrEqual(5000);
+  });
+
+  // The audit-#29 suppression contract: StatusBar.set() returns false when
+  // the needs-reload lock owns the bar — an ad whose paint never landed (or
+  // stopped landing) must never bill. These pin both `=== false` gates; the
+  // default mock returns undefined (a void setter counts as painted), so
+  // without an explicit false neither gate is ever exercised.
+  it("never starts a show or bills when the reload lock suppresses the paint", () => {
+    const d = makeDeps();
+    d.statusBar.set.mockReturnValue(false);  // needs-reload lock owns the bar
+    d.logTail.current.mockReturnValue(thinking());
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(12_000);
+    expect(d.metrics.send).not.toHaveBeenCalled();
+    expect(d.barState.adShowing).toBe(false);
+  });
+
+  it("ends the show (and stops billing) when a mid-show repaint is suppressed", () => {
+    const d = makeDeps();
+    d.logTail.current.mockReturnValue(thinking());
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(3000);            // show opened, painting normally
+    expect(d.barState.adShowing).toBe(true);
+    d.statusBar.set.mockReturnValue(false);  // lock engages mid-show
+    vi.advanceTimersByTime(1000);            // next re-assert is suppressed
+    expect(d.barState.adShowing).toBe(false);
+    const viewable = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "impression_viewable");
+    expect(viewable).toHaveLength(1);        // final viewable fired on endShow
+    const ticksBefore = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "view_tick").length;
+    vi.advanceTimersByTime(15_000);          // suppressed restarts never bill
+    const ticksAfter = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "view_tick").length;
+    expect(ticksAfter).toBe(ticksBefore);
   });
 });

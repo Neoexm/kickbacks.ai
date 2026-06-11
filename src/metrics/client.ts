@@ -128,6 +128,11 @@ export class MetricsClient {
       if (!res.ok) {
         dlog("ext", "metric.send_failed", { status: res.status, event });
       }
-    } catch { /* metrics are best-effort */ }
+    } catch (e) {
+      // Still best-effort (never throws past here) — but a network-level
+      // failure must stay greppable, not a total observability blackout.
+      dlog("ext", "metric.send_error",
+        { event, msg: e instanceof Error ? e.message : String(e) });
+    }
   }
 }

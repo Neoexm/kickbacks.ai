@@ -9,6 +9,15 @@ const AD_DISPLAY_HOLD_MS = 6_000;
 const POLL_INTERVAL_MS = 1_000;
 const VIEW_TICK_INTERVAL_MS = 5_000;
 const FRESH_ACTIVITY_MS = 4_000;
+// Time-boxed show cycle: agentic sessions keep `thinking` true for HOURS
+// (every tool call rewrites the transcript), so "ad while thinking" used to
+// degenerate into "ad forever" and the earnings display never surfaced
+// (2026-06-10 report: "the ad never disappears"). A show now runs at most
+// AD_SHOW_MAX_MS continuously, then the bar rests on the earnings/balance
+// display for AD_REST_MS before the ad may return. Billing stops with each
+// show (endShow), so the cap also bounds continuous statusbar dwell.
+const AD_SHOW_MAX_MS = 60_000;
+const AD_REST_MS = 20_000;
 
 export interface StatusBarAdDeps {
   logTail: LogTail;
@@ -27,12 +36,26 @@ export interface StatusBarAdDeps {
   // re-asserts the ad each tick as a backstop against other setters
   // (kill/offline/incompatible) clobbering it mid-display.
   barState: { adShowing: boolean };
+  // TERMINAL-activity signal (the Steven fix): a second LogTail pinned to the
+  // newest entrypoint:"cli" transcript (locateClaudeCliLog). A TUI-only user
+  // never produces panel activity — locateClaudeCodeLog returns "" for them
+  // by design (audit #24, desync-watchdog safety) — so without this signal
+  // the statusbar ad never engages and their billing silently dies. The CLI
+  // path is gated on `windowFocused` (below): a focused VS Code window with a
+  // live terminal turn means the bar is actually on screen.
+  cliTail?: Pick<LogTail, "current" | "activityAgeMs">;
+  // True when this VS Code window has OS focus (vscode.window.state.focused).
+  // Only consulted for the CLI-activity path — a turn running in an EXTERNAL
+  // terminal while VS Code is backgrounded must not bill a bar nobody sees.
+  // Absent (older call sites / tests) ⇒ the CLI path stays off entirely.
+  windowFocused?: () => boolean;
 }
 
 export function setupStatusBarAd(deps: StatusBarAdDeps): void {
   const {
     logTail, metrics, statusBar, adRef, killedRef,
     ccVersion, showActive, timers, barState,
+    cliTail, windowFocused,
   } = deps;
 
   let showing = false;
@@ -40,6 +63,8 @@ export function setupStatusBarAd(deps: StatusBarAdDeps): void {
   let revertTimer: NodeJS.Timeout | null = null;
   let viewTickTimer: NodeJS.Timeout | null = null;
   let shownAd: PatchAd | null = null;
+  let showStartedAt = 0;
+  let restUntil = 0;
 
   // Visible-time accrual with a suspend clamp (the audit-#23 contract, same
   // as the CC block): visibleMs used to be a raw wall-clock span
@@ -128,7 +153,18 @@ export function setupStatusBarAd(deps: StatusBarAdDeps): void {
       const activityAgeMs = logTail.activityAgeMs();
       const freshTranscript = activityAgeMs !== null
         && activityAgeMs <= FRESH_ACTIVITY_MS;
-      const thinking = activity ? !activity.done : freshTranscript;
+      const panelThinking = activity ? !activity.done : freshTranscript;
+      // Terminal turns count too — but only while THIS window is focused
+      // (integrated-terminal TUI usage: the bar is visibly on screen). The
+      // panel path is checked first so the common case pays no extra stat.
+      let cliThinking = false;
+      if (!panelThinking && cliTail && windowFocused?.()) {
+        const cliAct = cliTail.current();
+        const cliAge = cliTail.activityAgeMs();
+        const cliFresh = cliAge !== null && cliAge <= FRESH_ACTIVITY_MS;
+        cliThinking = cliAct ? !cliAct.done : cliFresh;
+      }
+      const thinking = panelThinking || cliThinking;
       const ad = adRef.current;
       // Eligible to show the ad: Claude is thinking, we have a REAL (user-
       // crediting) ad, and not killed. Demo ads (signed-out preview) are
@@ -142,7 +178,19 @@ export function setupStatusBarAd(deps: StatusBarAdDeps): void {
       // serving gate so a deliberate "Disable Kickbacks" (or a crash-canary
       // suspension) also ends the show and stops billing (wave 2, audit #4).
       const eligible = thinking && !!ad && !ad.demo && !killedRef.current
-        && canPatch();
+        && canPatch() && Date.now() >= restUntil;
+
+      // Show time-box: a continuous show hits its cap mid-thinking → end it
+      // (billing stops, impression_viewable fires with the real visible
+      // time), paint the earnings display IMMEDIATELY (that's the point —
+      // the balance must get screen time), and rest before re-showing.
+      if (showing && Date.now() - showStartedAt >= AD_SHOW_MAX_MS) {
+        endShow();
+        restUntil = Date.now() + AD_REST_MS;
+        clearRevert();
+        if (!killedRef.current) void showActive();
+        return;
+      }
 
       if (eligible) {
         clearRevert();
@@ -156,6 +204,7 @@ export function setupStatusBarAd(deps: StatusBarAdDeps): void {
           showing = true;
           accruedVisibleMs = 0;
           lastAccrualMs = Date.now();
+          showStartedAt = Date.now();
           shownAd = ad;
           barState.adShowing = true;
           corr = "statusbar." + ad!.adId + "." +

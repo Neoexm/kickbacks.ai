@@ -21,7 +21,8 @@
  *    • the crash canary suspends the whole session until a manual re-enable.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync }
+  from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -298,6 +299,64 @@ describe("matrix: bootCanary boot-path writers", () => {
   });
 });
 
+// ── bootCanary either-target auto-enable (codex-only machines) ────────────
+// The clean-boot auto-enable used to gate on the CLAUDE preflight alone, so
+// a Codex-only machine never persisted K_ON and never served. The widened
+// 4th arg folds the codex preflight in; DebugController.apply() already
+// treats a codex-only patch as success (wave-2A-F07).
+describe("bootCanary either-target auto-enable (codex-only)", () => {
+  const mkIncompatCc = () => ({
+    name: "claude-code" as const,
+    preflight: () => ({ ok: true, compatible: false, version: null,
+      reason: "target not found" }),
+    version: () => null,
+    isPatched: vi.fn(() => false),
+    applyPatch: vi.fn(() => ({ ok: false, reason: "target not found" })),
+    restore: vi.fn(() => ({ ok: true, restored: false })),
+  });
+  const mkCodex = () => ({
+    name: "codex" as const,
+    preflight: () => ({ ok: true, compatible: true, version: "26.513.21555" }),
+    version: () => "26.513.21555",
+    isPatched: vi.fn(() => false),
+    applyPatch: vi.fn(() => ({ ok: true })),
+    restore: vi.fn(() => ({ ok: true, restored: true })),
+  });
+
+  it("anyTargetCompatible=true: codex-only clean boot persists K_ON via the"
+    + " codex-folded apply", async () => {
+    clearCanary();
+    applyMode({ kill: "clear", kOn: true, suspended: false });
+    const adapter = mkIncompatCc();
+    const codex = mkCodex();
+    const ctx = makeContext();
+    const d = new DebugController(adapter as never, ctx as never, () => {});
+    d.setCodexAdapter(codex as never);
+    try {
+      await setupBootCanary(adapter as never, d, ctx as never, true);
+      expect(ctx.globalState.get("kickbacks.debug.on"),
+        "K_ON must persist when the codex leg patches").toBe(true);
+      expect(codex.applyPatch).toHaveBeenCalled();
+    } finally { await d.dispose(); clearCanary(); }
+  });
+
+  it("flag omitted: legacy claude-only gate — codex-only boot does NOT"
+    + " auto-enable", async () => {
+    clearCanary();
+    applyMode({ kill: "clear", kOn: true, suspended: false });
+    const adapter = mkIncompatCc();
+    const codex = mkCodex();
+    const ctx = makeContext();
+    const d = new DebugController(adapter as never, ctx as never, () => {});
+    d.setCodexAdapter(codex as never);
+    try {
+      await setupBootCanary(adapter as never, d, ctx as never);
+      expect(ctx.globalState.get("kickbacks.debug.on")).toBeUndefined();
+      expect(codex.applyPatch).not.toHaveBeenCalled();
+    } finally { await d.dispose(); clearCanary(); }
+  });
+});
+
 // ── Webview-injection writers + the live loopback /ad route ───────────────
 async function mkWebview() {
   const actx = createActivationContext();
@@ -491,5 +550,51 @@ describe("crash-canary suspension (audit #14)", () => {
       expect(canPatch()).toBe(true);
       expect(adapter.applyPatch).toHaveBeenCalled();
     } finally { await d.dispose(); clearCanary(); }
+  });
+});
+
+// ── Settle-unlink token guard: the 5s canary-clear timer may only delete the
+//    canary it OWNS. The file lives in the shared ~/.vibe-ads, so a second
+//    VS Code window (or a parallel test worker) can re-write it between our
+//    write and our settle — an unguarded unlink stripped THAT activation's
+//    crash protection (and was the source of this suite's cross-test flake).
+describe("bootCanary settle-unlink token guard", () => {
+  // setupBootCanary's writer legs are exercised by the matrix above; here a
+  // stub DebugController keeps these tests to the canary file mechanics only
+  // (on()=true skips auto-enable, so no loopback is minted under fake timers).
+  const stubDebugCtl = () => ({
+    on: () => true,
+    shouldAutoEnableOnSignIn: () => false,
+    setOn: vi.fn(async () => {}),
+    reapplyIfOn: vi.fn(async () => {}),
+    cyclePatch: () => ({ ok: true, reason: "stub" }),
+  });
+
+  it("clears its own canary once the settle window elapses", async () => {
+    vi.useFakeTimers();
+    clearCanary();
+    try {
+      await setupBootCanary(
+        mkCcAdapter() as never, stubDebugCtl() as never, makeContext() as never);
+      expect(existsSync(CANARY)).toBe(true);
+      vi.advanceTimersByTime(6000);
+      expect(existsSync(CANARY), "own canary clears after settle").toBe(false);
+    } finally { vi.useRealTimers(); clearCanary(); }
+  });
+
+  it("leaves a canary re-written by another activation alone", async () => {
+    vi.useFakeTimers();
+    clearCanary();
+    try {
+      await setupBootCanary(
+        mkCcAdapter() as never, stubDebugCtl() as never, makeContext() as never);
+      // A second window / parallel worker re-writes the shared file before
+      // our settle timer fires.
+      writeFileSync(CANARY, "someone-elses-fresh-canary");
+      vi.advanceTimersByTime(6000);
+      expect(existsSync(CANARY),
+        "a foreign canary must survive our settle timer").toBe(true);
+      expect(readFileSync(CANARY, "utf8")).toBe("someone-elses-fresh-canary");
+    } finally { vi.useRealTimers(); clearCanary(); }
   });
 });

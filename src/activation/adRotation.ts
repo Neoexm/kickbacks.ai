@@ -149,19 +149,31 @@ async function refreshPortfolio(
       // no reason to re-mint the loopback/corr). This closes the silent "billing
       // stops after ~5 min on stable inventory" bug: pre-fix the refreshed
       // response was discarded wholesale, so `activeAd.sessionToken` aged out.
+      //
+      // The `demo` stamp travels WITH the token: a mid-session demotion (token
+      // death → this refresh comes from the DEMO portfolio) can return the same
+      // adId set, and an adopted demo token on an object still marked demo:false
+      // would keep the status bar showing ads while signed out — bypassing its
+      // deliberate sign-in gate (statusBarAd keys on `!ad.demo`, audit BL-187).
+      // Same in reverse: a re-auth must clear the stamp so real ads aren't
+      // suppressed as demo.
       const freshByAdId = new Map(r.ads.map((a) => [a.adId, a]));
       state.adQueue = state.adQueue.map((a) => {
         const fresh = freshByAdId.get(a.adId);
-        return fresh ? { ...a, sessionToken: fresh.sessionToken } : a;
+        return fresh
+          ? { ...a, sessionToken: fresh.sessionToken, demo: fresh.demo }
+          : a;
       });
       const active = deps.activeAdRef.current;
       const freshActive = active ? freshByAdId.get(active.adId) : undefined;
       if (active && freshActive) {
         deps.activeAdRef.current = {
-          ...active, sessionToken: freshActive.sessionToken };
+          ...active, sessionToken: freshActive.sessionToken,
+          demo: freshActive.demo };
         if (deps.adRef.current && deps.adRef.current.adId === active.adId) {
           deps.adRef.current = {
-            ...deps.adRef.current, sessionToken: freshActive.sessionToken };
+            ...deps.adRef.current, sessionToken: freshActive.sessionToken,
+            demo: freshActive.demo };
         }
       }
       dlog("ext", "portfolio.token_refreshed",

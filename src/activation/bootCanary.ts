@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, writeFileSync, mkdirSync, unlinkSync, statSync } from "node:fs";
+import { existsSync, writeFileSync, mkdirSync, unlinkSync, statSync,
+         readFileSync } from "node:fs";
 import type { DebugController } from "../debug";
 import type { TargetAdapter } from "../adapters/types";
 import { canPatch, suspendServing } from "../servingGate";
@@ -16,16 +17,30 @@ const FIRST_RUN_KEY = "kickbacks.firstRun.completed";
 /** `firstRun` is true exactly once — the activation that flips
  *  FIRST_RUN_KEY (i.e. the install). The crash-recovery path reports
  *  false (no patch was applied, so a reload nudge would be a lie) and
- *  leaves the key unset, so the next clean activation still counts. */
+ *  leaves the key unset, so the next clean activation still counts.
+ *
+ *  `anyTargetCompatible` (optional) widens the clean-boot auto-enable gate
+ *  to EITHER webview target: a Codex-only machine (no/incompatible Claude
+ *  Code) must still persist K_ON on first run, or it never serves —
+ *  DebugController.apply() already treats a Codex-only patch as success.
+ *  Omitted ⇒ falls back to the Claude-only preflight (legacy call shape). */
 export async function setupBootCanary(
   adapter: TargetAdapter,
   debugCtl: DebugController,
   ctx: vscode.ExtensionContext,
+  anyTargetCompatible?: boolean,
 ): Promise<{ firstRun: boolean }> {
   let firstRun = false;
   let canaryFromCrash = false;
+  // The settle timer below may only unlink the canary whose content it owns
+  // (crash path: the file it observed; clean path: the token it wrote). The
+  // canary lives in the shared ~/.vibe-ads, so a second VS Code window (or a
+  // parallel test worker) may re-write it at any time — an unguarded unlink
+  // would strip THAT activation's crash protection.
+  let settleToken = "";
   try {
     if (existsSync(CANARY_PATH)) {
+      settleToken = readFileSync(CANARY_PATH, "utf8");
       const age = Date.now() - statSync(CANARY_PATH).mtimeMs;
       if (age < CANARY_STALE_MS) canaryFromCrash = true;
     }
@@ -49,11 +64,12 @@ export async function setupBootCanary(
   } else {
     try {
       mkdirSync(join(homedir(), ".vibe-ads"), { recursive: true });
-      writeFileSync(CANARY_PATH, String(Date.now()));
+      settleToken = String(Date.now());
+      writeFileSync(CANARY_PATH, settleToken);
     } catch { /* canary is best-effort */ }
 
     try {
-      const pfBoot = adapter.preflight();
+      const targetOk = anyTargetCompatible ?? adapter.preflight().compatible;
       // Auto-enable on a clean boot only when the consent gate allows it
       // (never-toggled first run, or injection was ON before the last
       // sign-out). PRESERVE a deliberate "Disable Kickbacks" — the old
@@ -61,7 +77,7 @@ export async function setupBootCanary(
       // (audit EXT-01 / 2A-02). canPatch() additionally blocks the
       // auto-enable's setOn(true) apply on a persisted-kill boot (wave 2,
       // audit #19) — setOn itself is the MANUAL path and stays ungated.
-      if (pfBoot.compatible && canPatch() && !debugCtl.on()
+      if (targetOk && canPatch() && !debugCtl.on()
           && debugCtl.shouldAutoEnableOnSignIn()) {
         await debugCtl.setOn(true);
         dlog("ext", "boot.autoenable", { applied: true });
@@ -92,9 +108,14 @@ export async function setupBootCanary(
     }
   }
 
-  // Clear the canary once VS Code has been alive for SETTLE_MS.
+  // Clear the canary once VS Code has been alive for SETTLE_MS — but only
+  // if it is still OUR canary (see settleToken above).
   setTimeout(() => {
-    try { unlinkSync(CANARY_PATH); } catch { /* ignore */ }
+    try {
+      if (readFileSync(CANARY_PATH, "utf8") === settleToken) {
+        unlinkSync(CANARY_PATH);
+      }
+    } catch { /* ignore */ }
   }, SETTLE_MS).unref?.();
   return { firstRun };
 }
