@@ -134,19 +134,30 @@ export class CodexAdapter implements TargetAdapter {
     } catch { /* best-effort */ }
   }
 
-  /** The ThinkingShimmer entry: the identifier re-exported `as n`, plus its
-   *  `function NAME(ARG){` site (insertion point is just past the `{`). */
-  private locateEntry(src: string):
-    { name: string; arg: string; at: number } | null {
+  private locateEntry(src: string, alias: "n" | "t"):
+    { alias: "n" | "t"; name: string; arg: string; at: number } | null {
     const ex = EXPORT_RE.exec(src);
     if (!ex) return null;
-    const m = /([A-Za-z0-9_$]+)\s+as\s+n\b/.exec(ex[1]);
+    const m = new RegExp("([A-Za-z0-9_$]+)\\s+as\\s+" + alias + "\\b")
+      .exec(ex[1]);
     if (!m) return null;
     const sig = new RegExp(
       "function\\s+" + m[1] + "\\s*\\(\\s*([A-Za-z0-9_$]+)\\s*\\)\\s*\\{"
     ).exec(src);
     if (!sig) return null;
-    return { name: m[1], arg: sig[1], at: sig.index + sig[0].length };
+    return { alias, name: m[1], arg: sig[1], at: sig.index + sig[0].length };
+  }
+  private locateEntries(src: string):
+    { alias: "n" | "t"; name: string; arg: string; at: number }[] {
+    const out: { alias: "n" | "t"; name: string; arg: string; at: number }[] = [];
+    const seen = new Set<number>();
+    for (const alias of ["n", "t"] as const) {
+      const loc = this.locateEntry(src, alias);
+      if (!loc || seen.has(loc.at)) continue;
+      seen.add(loc.at);
+      out.push(loc);
+    }
+    return out;
   }
   private jsxName(src: string): string | null {
     const m = JSX_RE.exec(src);
@@ -180,7 +191,7 @@ export class CodexAdapter implements TargetAdapter {
       const bak = this.existingBackupPath();
       const raw = readFileSync(bak ?? this.target, "utf8");
       const src = stripInjection(raw);
-      const ok = this.locateEntry(src) !== null
+      const ok = this.locateEntry(src, "n") !== null
         && /defaultMessage:`Thinking`/.test(src)
         && this.jsxName(src) !== null;
       return ok
@@ -228,7 +239,8 @@ export class CodexAdapter implements TargetAdapter {
       // self-heals a file corrupted by the old marker-only strip.
       const pristine = stripInjection(
         bak ? readFileSync(bak, "utf8") : live);
-      const loc = this.locateEntry(pristine);
+      const loc = this.locateEntry(pristine, "n");
+      const entries = this.locateEntries(pristine);
       const jsx = this.jsxName(pristine);
       if (!loc || !jsx) return { ok: false, reason: "anchors not found" };
       // One-time backup of the CLEAN pristine — never a patched/corrupted
@@ -236,16 +248,19 @@ export class CodexAdapter implements TargetAdapter {
       // backup itself could become poisoned).
       if (!bak)
         writeFileSync(this.backupPath(), Buffer.from(pristine, "utf8"));
-      const block = this.renderBlock(p, loc.arg, jsx);
-      // Inject as the entry's first statement, BEFORE the props destructure +
+      // Inject as each entry's first statement, BEFORE the props destructure +
       // React-Compiler memo cache. Markers wrap the WHOLE `arg=(IIFE)||arg;`
       // statement (OUTSIDE the wrapper) so a future strip removes it entirely
       // — no empty-wrapper residue can ever be left behind. The IIFE always
       // returns undefined (`arg = undefined || arg`) so Codex's component is
       // never altered; the ad renders via a body-level overlay.
-      const out = pristine.slice(0, loc.at) +
-        BLOCK_START + loc.arg + "=(" + block + ")||" + loc.arg + ";" +
-        BLOCK_END + pristine.slice(loc.at);
+      let out = pristine;
+      for (const ent of [...entries].sort((a, b) => b.at - a.at)) {
+        const block = this.renderBlock(p, ent.arg, jsx);
+        out = out.slice(0, ent.at) +
+          BLOCK_START + ent.arg + "=(" + block + ")||" + ent.arg + ";" +
+          BLOCK_END + out.slice(ent.at);
+      }
       const buf = Buffer.from(out, "utf8");
       if (sha256(buf) !== sha256(readFileSync(this.target)))
         writeFileSync(this.target, buf);

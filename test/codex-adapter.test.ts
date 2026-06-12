@@ -96,17 +96,18 @@ describe("CodexAdapter", () => {
       .length).toBe(1);
   });
 
-  it("applyPatch: one-time backup, single block at function v(e){, idempotent", () => {
+  it("applyPatch: one-time backup, blocks at function v(e){ and g(e){, idempotent", () => {
     const a = new CodexAdapter(target);
     expect(a.applyPatch(params).ok).toBe(true);
     const out1 = readFileSync(target, "utf8");
     expect(existsSync(target + ".vibe-ads-backup")).toBe(true);
     // Markers wrap the WHOLE arg= statement (OUTSIDE the wrapper) so a future
     // strip removes it entirely — no empty `e=()||e;` residue can remain.
+    expect(out1).toMatch(/function g\(e\)\{\/\* VIBE-ADS-START \*\/e=\(/);
     expect(out1).toMatch(/function v\(e\)\{\/\* VIBE-ADS-START \*\/e=\(/);
     expect(out1).toMatch(/\)\|\|e;\/\* VIBE-ADS-END \*\/\s*let /);
     expect(out1).toContain(params.adText);
-    expect((out1.match(/VIBE-ADS-START/g) || []).length).toBe(1);
+    expect((out1.match(/VIBE-ADS-START/g) || []).length).toBe(2);
     expect(out1).toContain('"http://127.0.0.1:5555/vibe-ads/lt"'); // loopbackBase substituted
     a.applyPatch(params);                        // idempotent (re-derived from pristine)
     expect(readFileSync(target, "utf8")).toBe(out1);
@@ -119,6 +120,8 @@ describe("CodexAdapter", () => {
     // Body-level overlay block: a pure passthrough IIFE (returns undefined →
     // `e = <iife> || e` leaves Codex's component untouched). The arg is still
     // wrapped by the adapter; no JSX runtime is injected (DOM-only overlay).
+    expect(out).toMatch(
+      /function g\(e\)\{\/\* VIBE-ADS-START \*\/e=\(.*\)\|\|e;\/\* VIBE-ADS-END \*\//s);
     expect(out).toMatch(
       /function v\(e\)\{\/\* VIBE-ADS-START \*\/e=\(.*\)\|\|e;\/\* VIBE-ADS-END \*\//s);
     expect(out).toContain("data-vibe-ads"); // overlay element marker present
@@ -143,7 +146,7 @@ describe("CodexAdapter", () => {
       const a = new CodexAdapter(target);
       expect(a.applyPatch(params).ok).toBe(true);
       const o1 = readFileSync(target, "utf8");
-      expect((o1.match(/VIBE-ADS-START/g) || []).length).toBe(1);
+      expect((o1.match(/VIBE-ADS-START/g) || []).length).toBe(2);
       expect(o1).not.toMatch(/=\(\)\|\|/);                  // zero empty residue
       a.applyPatch(params);
       expect(readFileSync(target, "utf8")).toBe(o1);        // idempotent

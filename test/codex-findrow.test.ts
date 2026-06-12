@@ -90,6 +90,25 @@ function makeLiveShimmer(doc: Document): HTMLElement {
   return el;
 }
 
+function makeSplitLiveShimmer(doc: Document): HTMLElement {
+  const wrap = doc.createElement("span");
+  wrap.className = "text-size-chat inline-flex min-w-0 items-center "
+    + "text-token-conversation-summary-trailing";
+  const spacer = doc.createElement("span");
+  spacer.setAttribute("aria-hidden", "true");
+  spacer.className = "h-4 w-0 shrink-0";
+  const el = doc.createElement("span");
+  el.className = "loading-shimmer-pure-text _cadencedShimmer_1bpr9_1 "
+    + "min-w-0 truncate";
+  const a = doc.createElement("span"); a.textContent = "Thinking";
+  const b = doc.createElement("span"); b.textContent = "Thinking";
+  el.appendChild(a); el.appendChild(b);
+  setRect(el, { x: 120, y: 220, w: 180, h: 20 });
+  wrap.appendChild(spacer);
+  wrap.appendChild(el);
+  return wrap;
+}
+
 // The post-turn "Thinking 1.2s" summary chip Codex leaves in chat history
 // after streaming ends. Same class trio (text-size-chat / truncate /
 // select-none) BUT no loading-shimmer-* class and (typically) display:none
@@ -111,6 +130,19 @@ describe("S9 codex findRow — live shimmer only, never stale chip", () => {
     const overlay = doc.querySelector('[data-vibe-ads="codex"]');
     expect(overlay).toBeTruthy();
     expect(overlay!.querySelector('[data-vibe-ads-ad]')).toBeTruthy();
+    dom.window.close();
+  });
+
+  it("paints overlay on Codex 26.609 split wrapper/child shimmer markup", async () => {
+    const { dom, doc, mc } = makeDom();
+    mc.appendChild(makeSplitLiveShimmer(doc));
+    bootAsset(dom);
+    await sleep(200);
+    const overlay = doc.querySelector('[data-vibe-ads="codex"]') as
+      HTMLElement | null;
+    expect(overlay).toBeTruthy();
+    expect(overlay!.style.left).toBe("120px");
+    expect(overlay!.style.top).toBe("220px");
     dom.window.close();
   });
 

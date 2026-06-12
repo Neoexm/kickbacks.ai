@@ -266,15 +266,24 @@
     // chip and `isThinkingRow()` returned true forever — overlay never
     // released at idle (row 03 regression) and stuck to turn 1 on multi-
     // turn prompts (row 08, "glued to turn 1").
+    function hasTextSizeChatNear(el) {
+      try {
+        var n = el, hops = 0;
+        while (n && n.nodeType === 1 && hops++ < 4) {
+          var c = " " + (n.className || "") + " ";
+          if (c.indexOf("text-size-chat") !== -1) return true;
+          n = n.parentElement;
+        }
+      } catch (e) {}
+      return false;
+    }
     function findRow() {
       var els = document.querySelectorAll(
-        '[class*="text-size-chat"][class*="truncate"]');
+        '[class*="loading-shimmer"][class*="truncate"]');
       for (var i = 0; i < els.length; i++) {
         var el = els[i];
         if (el.nodeType !== 1) continue;
-        var c = " " + (el.className || "") + " ";
-        if (c.indexOf("select-none") === -1) continue;
-        if (c.indexOf("loading-shimmer") === -1) continue;
+        if (!hasTextSizeChatNear(el)) continue;
         var r = el.getBoundingClientRect && el.getBoundingClientRect();
         if (!r || (!r.width && !r.height)) continue;
         // Honour visibility / opacity. Codex 26.x keeps the live shimmer
